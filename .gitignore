@@ -13,9 +13,27 @@ target
 # Contains mutation testing data
 **/mutants.out*/
 
-# RustRover
-#  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
-#  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
-#  and can be added to the global gitignore or merged into this file.  For a more nuclear
-#  option (not recommended) you can uncomment the following to ignore the entire idea folder.
-#.idea/
+# IDE files (local only, never ship)
+.idea/
+
+# -----------------------------------------------------------------------
+# Internal automation artifacts — private, never ship
+# These files are local-only workflow helpers for the Ralph loop and
+# Claude Code. They must never be committed to the repository.
+# Public files may NOT reference any of the paths listed below.
+# -----------------------------------------------------------------------
+AGENTS.md
+PROMPT_plan.md
+PROMPT_build.md
+loop.ps1
+RALPH_COMPLETE
+IMPLEMENTATION_PLAN.md
+COMMIT_STYLE_GUIDE.md
+HISTORY.md
+.ralph-exclude
+
+# Internal spec/design docs (private — agent-only context)
+specs/
+
+# Claude Code local agent files
+.claude/
