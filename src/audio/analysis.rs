@@ -7,13 +7,18 @@
 /// detections from background noise.
 use realfft::RealFftPlanner;
 use rustfft::num_complex::Complex;
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// Lower bound of human speech fundamental frequency range in Hz.
-const SPEECH_FREQ_MIN: f32 = 65.0;
+/// Set to 85 Hz to exclude electrical hum (60 Hz mains noise and its harmonics)
+/// from triggering false voice detections.
+const SPEECH_FREQ_MIN: f32 = 85.0;
 
 /// Upper bound of human speech fundamental frequency range in Hz.
-const SPEECH_FREQ_MAX: f32 = 300.0;
+const SPEECH_FREQ_MAX: f32 = 350.0;
 
 /// FFT window size in samples. 2048 at 48kHz gives ~23 Hz resolution
 /// with ~42ms latency per frame, a good balance for real-time voice.
@@ -24,17 +29,17 @@ const FFT_SIZE: usize = 2048;
 const HOP_SIZE: usize = 1024;
 
 /// Exponential moving average smoothing factor for noise floor estimation.
-/// Lower values produce slower, more stable adaptation.
-const NOISE_FLOOR_ALPHA: f32 = 0.02;
+/// Higher values produce faster adaptation to changing ambient noise levels.
+const NOISE_FLOOR_ALPHA: f32 = 0.05;
 
 /// Multiplier above noise floor required to trigger voice detection.
-const VOICE_TRIGGER_MULTIPLIER: f32 = 3.0;
+const VOICE_TRIGGER_MULTIPLIER: f32 = 6.0;
 
 /// Lower multiplier for maintaining voice detection (hysteresis prevents chattering).
 const VOICE_HOLD_MULTIPLIER: f32 = 1.5;
 
-/// Minimum noise floor to prevent overly sensitive detection in silent rooms.
-const MIN_NOISE_FLOOR: f32 = 0.001;
+/// Minimum noise floor to prevent overly sensitive detection in noisy rooms.
+const MIN_NOISE_FLOOR: f32 = 0.02;
 
 /// Real-time voice frequency analyzer using FFT with adaptive noise floor.
 ///
@@ -62,6 +67,8 @@ pub struct FrequencyAnalyzer {
     input_buffer: Vec<f32>,
     fft_scratch: Vec<f32>,
     fft_output: Vec<Complex<f32>>,
+    /// Pre-allocated magnitude buffer — avoids a heap allocation on every frame.
+    magnitudes: Vec<f32>,
     noise_floor: f32,
     voice_active: bool,
     sample_rate: f32,
@@ -88,6 +95,7 @@ impl FrequencyAnalyzer {
             })
             .collect();
 
+        let mag_len = FFT_SIZE / 2 + 1;
         FrequencyAnalyzer {
             fft,
             fft_size: FFT_SIZE,
@@ -96,6 +104,7 @@ impl FrequencyAnalyzer {
             input_buffer: Vec::with_capacity(FFT_SIZE * 4),
             fft_scratch,
             fft_output,
+            magnitudes: vec![0.0; mag_len],
             noise_floor: 0.01,
             voice_active: false,
             sample_rate: sample_rate as f32,
@@ -155,12 +164,11 @@ impl FrequencyAnalyzer {
             return None;
         }
 
-        // Compute magnitude spectrum
-        let magnitudes: Vec<f32> = self
-            .fft_output
-            .iter()
-            .map(|c| (c.re * c.re + c.im * c.im).sqrt())
-            .collect();
+        // Compute magnitude spectrum in-place (avoids per-frame heap allocation)
+        for (m, c) in self.magnitudes.iter_mut().zip(self.fft_output.iter()) {
+            *m = (c.re * c.re + c.im * c.im).sqrt();
+        }
+        let magnitudes = &self.magnitudes;
 
         // Compute frame energy (RMS of magnitudes in speech range)
         let min_bin = (SPEECH_FREQ_MIN * self.fft_size as f32 / self.sample_rate).ceil() as usize;
@@ -205,7 +213,46 @@ impl FrequencyAnalyzer {
             }
         }
 
-        // Parabolic interpolation for sub-bin frequency accuracy
+        let raw_freq = peak_bin as f32 * self.sample_rate / self.fft_size as f32;
+        tracing::debug!(
+            "FFT peak {:.1} Hz (bin {}, range {}-{}), energy {:.4}, threshold {:.4}",
+            raw_freq,
+            peak_bin,
+            min_bin,
+            max_bin,
+            frame_energy,
+            threshold
+        );
+
+        // Boundary check: a peak at min_bin or max_bin could be either a genuine
+        // voice fundamental at the edge of the search range, or noise spilling in
+        // from outside it.  Distinguish by looking at the adjacent bin outside the
+        // range: if it has MORE energy than the boundary bin the true peak lies
+        // outside the window (spillover → reject).  If the boundary bin has equal
+        // or more energy the voice really is at that frequency (accept).
+        if peak_bin == min_bin && min_bin > 0 && magnitudes[min_bin - 1] > magnitudes[min_bin] {
+            tracing::debug!(
+                "Boundary rejection: spillover at min ({:.1} Hz), outside energy {:.4} > inside {:.4}",
+                raw_freq, magnitudes[min_bin - 1], magnitudes[min_bin]
+            );
+            self.voice_active = false;
+            return None;
+        }
+        if peak_bin == max_bin
+            && max_bin + 1 < magnitudes.len()
+            && magnitudes[max_bin + 1] > magnitudes[max_bin]
+        {
+            tracing::debug!(
+                "Boundary rejection: spillover at max ({:.1} Hz), outside energy {:.4} > inside {:.4}",
+                raw_freq, magnitudes[max_bin + 1], magnitudes[max_bin]
+            );
+            self.voice_active = false;
+            return None;
+        }
+
+        // Parabolic interpolation for sub-bin frequency accuracy.
+        // Not possible at the exact boundaries (no neighbour on one side), so
+        // return the raw bin frequency in that case.
         let freq = if peak_bin > min_bin && peak_bin < max_bin {
             let alpha = magnitudes[peak_bin - 1];
             let beta = magnitudes[peak_bin];
@@ -215,13 +262,87 @@ impl FrequencyAnalyzer {
                 let delta = 0.5 * (alpha - gamma) / denominator;
                 (peak_bin as f32 + delta) * self.sample_rate / self.fft_size as f32
             } else {
-                peak_bin as f32 * self.sample_rate / self.fft_size as f32
+                raw_freq
             }
         } else {
-            peak_bin as f32 * self.sample_rate / self.fft_size as f32
+            raw_freq
         };
 
         Some(freq)
+    }
+}
+
+/// Background thread that drains the audio buffer and runs the FFT analyzer.
+///
+/// Moving analysis off the UI thread prevents brief UI freezes that occur when
+/// audio accumulates across ticks (e.g., due to OS preemption or window events)
+/// and triggers a cascade of many FFT frames on the main thread.
+///
+/// Results are sent via an mpsc channel and consumed by `latest_result()` from
+/// the UI thread on each animation tick.
+pub struct AnalysisWorker {
+    result_rx: std::sync::mpsc::Receiver<Option<f32>>,
+    shutdown: Arc<AtomicBool>,
+}
+
+impl AnalysisWorker {
+    /// Spawns an analysis worker thread that continuously processes audio from the
+    /// shared buffer and sends detected frequency results to the UI thread.
+    pub fn spawn(audio_buffer: Arc<Mutex<VecDeque<f32>>>, sample_rate: u32) -> Self {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_thread = shutdown.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        std::thread::spawn(move || {
+            let mut analyzer = FrequencyAnalyzer::new(sample_rate);
+            loop {
+                if shutdown_thread.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                let samples = match audio_buffer.try_lock() {
+                    Ok(mut buf) if !buf.is_empty() => buf.drain(..).collect::<Vec<_>>(),
+                    _ => Vec::new(),
+                };
+
+                if !samples.is_empty() {
+                    analyzer.push_samples(&samples);
+                    for result in analyzer.analyze() {
+                        if tx.send(result).is_err() {
+                            return; // UI dropped the receiver; exit cleanly
+                        }
+                    }
+                } else {
+                    // No new audio — yield to avoid spinning
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        });
+
+        AnalysisWorker {
+            result_rx: rx,
+            shutdown,
+        }
+    }
+
+    /// Returns the most recent frequency result from the worker, draining any
+    /// stale intermediate results. Returns `None` if no new frames are available.
+    ///
+    /// - `Some(Some(freq))` — voice detected at `freq` Hz
+    /// - `Some(None)`       — frame processed but silence (no voice above threshold)
+    /// - `None`             — no new frames since last call; keep current display state
+    pub fn latest_result(&self) -> Option<Option<f32>> {
+        let mut last = None;
+        while let Ok(r) = self.result_rx.try_recv() {
+            last = Some(r);
+        }
+        last
+    }
+}
+
+impl Drop for AnalysisWorker {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
     }
 }
 
@@ -256,17 +377,20 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_100hz_sine() {
+    fn test_detect_110hz_sine() {
+        // 100 Hz lands at min_bin (bin 4 = 93.75 Hz) where parabolic interpolation
+        // is unavailable, producing a 6.25 Hz quantisation error.  110 Hz sits
+        // between bins 4 and 5, safely off the boundary, so interpolation works.
         let mut analyzer = FrequencyAnalyzer::new(48000);
-        let samples = sine_wave(100.0, 48000, 48000);
+        let samples = sine_wave(110.0, 48000, 48000);
         analyzer.push_samples(&samples);
         let results = analyzer.analyze();
         let detected: Vec<f32> = results.into_iter().flatten().collect();
         assert!(!detected.is_empty(), "Should detect frequency");
         let last = *detected.last().unwrap();
         assert!(
-            (last - 100.0).abs() < 5.0,
-            "Expected ~100 Hz, got {} Hz",
+            (last - 110.0).abs() < 5.0,
+            "Expected ~110 Hz, got {} Hz",
             last
         );
     }

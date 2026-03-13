@@ -1,5 +1,5 @@
 /// User interface components for PitchBrick.
 ///
-/// Contains the menu bar construction and the color display canvas.
+/// Contains the color display canvas and the verbose log window.
 pub mod display;
-pub mod menu;
+pub mod log_window;

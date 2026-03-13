@@ -5,15 +5,13 @@
 /// to the system default.
 use cpal::traits::{DeviceTrait, HostTrait};
 
-/// A named audio device with its cpal device handle.
+/// A named audio device.
 ///
 /// # Fields
 ///
 /// * `name` - Human-readable device name from the OS (e.g., "Microphone (Realtek Audio)").
-/// * `device` - The underlying cpal device handle.
 pub struct NamedDevice {
     pub name: String,
-    pub device: cpal::Device,
 }
 
 /// Enumerates all available audio input (microphone) devices.
@@ -35,7 +33,7 @@ pub fn enumerate_input_devices() -> Vec<NamedDevice> {
     devices
         .filter_map(|d| {
             let name = d.description().ok()?.name().to_string();
-            Some(NamedDevice { name, device: d })
+            Some(NamedDevice { name })
         })
         .collect()
 }
@@ -59,7 +57,7 @@ pub fn enumerate_output_devices() -> Vec<NamedDevice> {
     devices
         .filter_map(|d| {
             let name = d.description().ok()?.name().to_string();
-            Some(NamedDevice { name, device: d })
+            Some(NamedDevice { name })
         })
         .collect()
 }

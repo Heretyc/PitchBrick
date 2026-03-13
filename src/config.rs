@@ -5,8 +5,11 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-/// Minimum gap in Hz enforced between gender frequency ranges when overlaps occur.
-const OVERLAP_PUSH_HZ: f32 = 10.0;
+/// Minimum gap in Hz that must always separate male_freq_high and female_freq_low.
+/// Based on the perceptual boundary zone (155–165 Hz) identified in the literature
+/// (Gelfer & Schofield 2000; Mount & Salmon 1988): voices above ~165 Hz are reliably
+/// perceived as female; voices below ~155 Hz are reliably perceived as male.
+const MIN_GENDER_GAP_HZ: f32 = 10.0;
 
 /// The user's selected target gender for vocal training.
 ///
@@ -15,9 +18,9 @@ const OVERLAP_PUSH_HZ: f32 = 10.0;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Gender {
-    /// Target feminine voice range (default ~165-255 Hz).
+    /// Target feminine voice range (default 165-255 Hz).
     Female,
-    /// Target masculine voice range (default ~85-180 Hz).
+    /// Target masculine voice range (default 85-155 Hz).
     Male,
 }
 
@@ -44,8 +47,11 @@ impl std::fmt::Display for Gender {
 ///
 /// All fields have sensible defaults derived from academic research on
 /// voice fundamental frequency (F0) ranges. Default frequency ranges:
-/// - Male: 85-180 Hz (Titze 1989; Pisanski 2021; Ferreira 2019)
-/// - Female: 165-255 Hz (same three sources)
+/// - Male:   85-155 Hz (Titze 1989; Gelfer & Schofield 2000; ASHA guidelines)
+/// - Female: 165-255 Hz (same sources)
+/// A mandatory 10 Hz gap between male_freq_high and female_freq_low is enforced
+/// at all times, reflecting the perceptual boundary zone (155-165 Hz) where
+/// listeners cannot reliably assign a gender to the voice.
 ///
 /// # Example
 ///
@@ -94,10 +100,10 @@ impl Default for Config {
             female_freq_low: 165.0,
             female_freq_high: 255.0,
             male_freq_low: 85.0,
-            male_freq_high: 180.0,
-            red_duration_seconds: 3.0,
-            reminder_tone_freq: 200.0,
-            reminder_tone_volume: 0.3,
+            male_freq_high: 155.0,
+            red_duration_seconds: 1.0,
+            reminder_tone_freq: 165.0,
+            reminder_tone_volume: 0.5,
             window_x: None,
             window_y: None,
             window_width: None,
@@ -186,29 +192,42 @@ impl Config {
         }
     }
 
-    /// Fixes overlapping frequency ranges by pushing the non-target gender's
-    /// boundary away by 10 Hz.
+    /// Enforces validity constraints on all frequency ranges:
     ///
-    /// When the target gender is female: if `male_freq_high >= female_freq_low`,
-    /// pushes `male_freq_high` down to `female_freq_low - 10`.
+    /// 1. Each range's low bound is clamped below its high bound (min 1 Hz apart).
+    /// 2. `male_freq_high` and `female_freq_low` are always separated by at least
+    ///    `MIN_GENDER_GAP_HZ` (10 Hz).  When they are too close, the boundary of
+    ///    the **non-target** gender is moved to restore the gap, preserving the
+    ///    range the user is actively training toward.
     ///
-    /// When the target gender is male: if `female_freq_low <= male_freq_high`,
-    /// pushes `female_freq_low` up to `male_freq_high + 10`.
+    /// This is called on every config load and save so invalid states can never
+    /// persist to disk.
     pub fn fix_overlap(&mut self) {
-        match self.target_gender {
-            Gender::Female => {
-                if self.male_freq_high >= self.female_freq_low {
-                    self.male_freq_high = self.female_freq_low - OVERLAP_PUSH_HZ;
-                    if self.male_freq_high < self.male_freq_low {
-                        self.male_freq_high = self.male_freq_low;
+        // Step 1: ensure low < high within each range.
+        if self.male_freq_low >= self.male_freq_high {
+            self.male_freq_low = (self.male_freq_high - 1.0).max(1.0);
+        }
+        if self.female_freq_low >= self.female_freq_high {
+            self.female_freq_low = (self.female_freq_high - 1.0).max(1.0);
+        }
+
+        // Step 2: enforce the inter-gender gap.
+        if self.male_freq_high >= self.female_freq_low - MIN_GENDER_GAP_HZ {
+            match self.target_gender {
+                Gender::Female => {
+                    // Protect the female range; push the male ceiling down.
+                    self.male_freq_high = self.female_freq_low - MIN_GENDER_GAP_HZ;
+                    // Don't let male ceiling drop below male floor.
+                    if self.male_freq_high <= self.male_freq_low {
+                        self.male_freq_high = self.male_freq_low + 1.0;
                     }
                 }
-            }
-            Gender::Male => {
-                if self.female_freq_low <= self.male_freq_high {
-                    self.female_freq_low = self.male_freq_high + OVERLAP_PUSH_HZ;
-                    if self.female_freq_low > self.female_freq_high {
-                        self.female_freq_low = self.female_freq_high;
+                Gender::Male => {
+                    // Protect the male range; push the female floor up.
+                    self.female_freq_low = self.male_freq_high + MIN_GENDER_GAP_HZ;
+                    // Don't let female floor exceed female ceiling.
+                    if self.female_freq_low >= self.female_freq_high {
+                        self.female_freq_low = self.female_freq_high - 1.0;
                     }
                 }
             }
@@ -235,9 +254,9 @@ mod tests {
         assert_eq!(config.female_freq_low, 165.0);
         assert_eq!(config.female_freq_high, 255.0);
         assert_eq!(config.male_freq_low, 85.0);
-        assert_eq!(config.male_freq_high, 180.0);
-        assert_eq!(config.red_duration_seconds, 3.0);
-        assert_eq!(config.reminder_tone_freq, 200.0);
+        assert_eq!(config.male_freq_high, 155.0);
+        assert_eq!(config.red_duration_seconds, 1.0);
+        assert_eq!(config.reminder_tone_freq, 165.0);
     }
 
     #[test]
@@ -252,28 +271,41 @@ mod tests {
 
     #[test]
     fn test_fix_overlap_female_target() {
+        // male_freq_high too close to female_freq_low: male ceiling should be pushed down.
         let mut config = Config {
             target_gender: Gender::Female,
-            female_freq_low: 160.0,
-            male_freq_high: 180.0,
+            female_freq_low: 165.0,
+            male_freq_high: 160.0, // only 5 Hz gap — below the 10 Hz minimum
             ..Config::default()
         };
         config.fix_overlap();
         assert!(config.male_freq_high < config.female_freq_low);
-        assert_eq!(config.male_freq_high, 150.0);
+        assert_eq!(config.male_freq_high, 155.0); // pushed to female_low - 10
     }
 
     #[test]
     fn test_fix_overlap_male_target() {
+        // female_freq_low too close to male_freq_high: female floor should be pushed up.
         let mut config = Config {
             target_gender: Gender::Male,
-            male_freq_high: 180.0,
-            female_freq_low: 170.0,
+            male_freq_high: 155.0,
+            female_freq_low: 160.0, // only 5 Hz gap — below the 10 Hz minimum
             ..Config::default()
         };
         config.fix_overlap();
         assert!(config.female_freq_low > config.male_freq_high);
-        assert_eq!(config.female_freq_low, 190.0);
+        assert_eq!(config.female_freq_low, 165.0); // pushed to male_high + 10
+    }
+
+    #[test]
+    fn test_fix_overlap_no_change_needed() {
+        // Default config already has a valid gap — nothing should move.
+        let mut config = Config::default();
+        let high_before = config.male_freq_high;
+        let low_before = config.female_freq_low;
+        config.fix_overlap();
+        assert_eq!(config.male_freq_high, high_before);
+        assert_eq!(config.female_freq_low, low_before);
     }
 
     #[test]
@@ -287,6 +319,6 @@ mod tests {
         let mut config = Config::default();
         assert_eq!(config.target_range(), (165.0, 255.0));
         config.target_gender = Gender::Male;
-        assert_eq!(config.target_range(), (85.0, 180.0));
+        assert_eq!(config.target_range(), (85.0, 155.0));
     }
 }

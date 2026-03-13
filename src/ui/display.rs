@@ -57,6 +57,8 @@ pub fn lerp_color(from: Color, to: Color, t: f32) -> Color {
 pub struct DisplayCanvas {
     /// The current display color (interpolated between states).
     pub color: Color,
+    /// Most recently detected frequency in Hz, or None if silent.
+    pub detected_freq: Option<f32>,
 }
 
 impl canvas::Program<Message> for DisplayCanvas {
@@ -87,6 +89,19 @@ impl canvas::Program<Message> for DisplayCanvas {
     ) -> Vec<Geometry> {
         let mut frame = Frame::new(renderer, bounds.size());
         frame.fill_rectangle(iced::Point::ORIGIN, bounds.size(), self.color);
+
+        let label = match self.detected_freq {
+            Some(hz) => format!("{:.0} Hz", hz),
+            None => "Not Speaking".to_string(),
+        };
+        frame.fill_text(canvas::Text {
+            content: label,
+            position: iced::Point::new(4.0, bounds.height - 22.0),
+            color: Color::WHITE,
+            size: iced::Pixels(16.0),
+            ..canvas::Text::default()
+        });
+
         vec![frame.into_geometry()]
     }
 
