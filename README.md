@@ -23,6 +23,7 @@ Download and run **rustup-init.exe** from [rustup.rs](https://rustup.rs), then f
 
 ### 2. Install PitchBrick
 
+1. Press **Win + R**, type:
 ```
 cargo install pitchbrick
 ```
