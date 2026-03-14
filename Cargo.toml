@@ -10,6 +10,8 @@ keywords = ["voice", "pitch", "transgender", "vocal-training", "audio"]
 categories = ["multimedia::audio", "gui", "accessibility"]
 include = [
     "src/**",
+    "docs/logo.ico",
+    "build.rs",
     "LICENSE",
     "README.md",
     "Cargo.lock",
@@ -30,3 +32,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = ["Win32_UI_WindowsAndMessaging"] }
 tray-icon = "0.21"
+
+[target.'cfg(windows)'.build-dependencies]
+winres = "0.1"

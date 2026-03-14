@@ -1,5 +1,7 @@
 # PitchBrick
 
+![PitchBrick](docs/logo.png)
+
 A real-time vocal pitch monitor for transgender voice training. PitchBrick displays a simple color indicator  green when your pitch is in your target range, red when it drifts out, and black when no voice is detected. An optional reminder tone plays after sustained out-of-range pitch to help build awareness.
 
 ## Features
