@@ -1,10 +1,11 @@
 [package]
 name = "pitchbrick"
-version = "2.0.3"
+version = "2.0.4"
 edition = "2021"
 license = "Apache-2.0"
 description = "Transgender vocal training pitch monitor"
 repository = "https://github.com/Heretyc/PitchBrick"
+homepage = "https://www.patreon.com/cw/lexi_bytes"
 readme = "README.md"
 keywords = ["voice", "pitch", "transgender", "vocal-training", "audio"]
 categories = ["multimedia::audio", "gui", "accessibility"]

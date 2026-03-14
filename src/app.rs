@@ -40,6 +40,8 @@ pub enum Message {
     /// The verbose log window was opened; ID already pre-assigned but message
     /// completes the open task.
     LogWindowOpened(window::Id),
+    /// User clicked the "Written by Lexi" footer to open the Patreon page.
+    OpenPatreon,
     /// Discards a task result with no side effect.
     Noop,
 }
@@ -515,6 +517,9 @@ impl PitchBrick {
                 } else if menu_id == ids.open_config {
                     drop(ids);
                     return self.update(Message::OpenSettings);
+                } else if menu_id == ids.patreon {
+                    drop(ids);
+                    return self.update(Message::OpenPatreon);
                 } else if menu_id == ids.quit {
                     drop(ids);
                     return self.update(Message::QuitRequested);
@@ -541,6 +546,12 @@ impl PitchBrick {
                 // The ID was already set at construction time; this message just
                 // completes the open task and can be used to confirm the ID.
                 self.log_window_id = Some(id);
+                Task::none()
+            }
+            Message::OpenPatreon => {
+                let _ = std::process::Command::new("cmd")
+                    .args(["/c", "start", "", "https://www.patreon.com/cw/lexi_bytes"])
+                    .spawn();
                 Task::none()
             }
             Message::Noop => Task::none(),

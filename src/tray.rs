@@ -45,6 +45,7 @@ pub enum TrayCommand {
 pub struct TrayMenuIds {
     pub gender_toggle: MenuId,
     pub open_config: MenuId,
+    pub patreon: MenuId,
     pub quit: MenuId,
     /// `(menu_id, device_name)` pairs for input devices.
     pub input_devices: Vec<(MenuId, String)>,
@@ -94,11 +95,13 @@ fn build_tray_menu(
         output_submenu.append(&item).ok();
     }
 
+    let patreon_item = MenuItem::new("Written by Lexi", true, None);
     let quit_item = MenuItem::new("Quit", true, None);
 
     let ids = TrayMenuIds {
         gender_toggle: gender_item.id().clone(),
         open_config: open_config_item.id().clone(),
+        patreon: patreon_item.id().clone(),
         quit: quit_item.id().clone(),
         input_devices: input_ids,
         output_devices: output_ids,
@@ -110,6 +113,8 @@ fn build_tray_menu(
     menu.append(&PredefinedMenuItem::separator()).ok();
     menu.append(&input_submenu).ok();
     menu.append(&output_submenu).ok();
+    menu.append(&PredefinedMenuItem::separator()).ok();
+    menu.append(&patreon_item).ok();
     menu.append(&PredefinedMenuItem::separator()).ok();
     menu.append(&quit_item).ok();
 
@@ -149,6 +154,7 @@ pub fn spawn_tray_thread(
     let placeholder_ids = TrayMenuIds {
         gender_toggle: MenuId::new("__placeholder__"),
         open_config: MenuId::new("__placeholder__"),
+        patreon: MenuId::new("__placeholder__"),
         quit: MenuId::new("__placeholder__"),
         input_devices: Vec::new(),
         output_devices: Vec::new(),

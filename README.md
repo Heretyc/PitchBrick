@@ -93,6 +93,10 @@ If the display stays red for longer than `red_duration_seconds`, a sine-wave rem
 
 Windows (uses WASAPI shared mode for audio, Win32 for screen metrics). A non-Windows fallback assumes 1920x1080 for window sizing.
 
+## Support 🏳️‍⚧️
+
+If PitchBrick is useful to you, consider supporting development on [Patreon](https://www.patreon.com/cw/lexi_bytes).
+
 ## License
 
 Apache-2.0
