@@ -14,7 +14,7 @@ A real-time vocal pitch monitor for transgender voice training. PitchBrick displ
 - **Always-on-top borderless window**  stays visible over games, VRChat, Discord, etc.
 - **Draggable window**  click anywhere on the canvas to reposition
 - **Hot-reloadable config**  edit `~/pitchbrick.toml` and changes apply instantly
-- **Device selection**  pick your microphone and speaker from the menu bar
+- **Device selection**  pick your microphone and speaker from the tray icon menu
 - **Window position/size persistence**  remembers where you left it
 
 ## Installation
@@ -51,11 +51,10 @@ Options:
   -h, --help     Print help
 ```
 
-On first launch, PitchBrick creates a default config at `~/pitchbrick.toml` and opens a small always-on-top window. Use the menu bar at the top to:
+On first launch, PitchBrick creates a default config at `~/pitchbrick.toml` and opens a small always-on-top window. Right-click the tray icon to:
 
 - Toggle target gender (Female/Male)
 - Open the config file in Notepad
-- Adjust reminder tone frequency and volume
 - Select input/output audio devices
 
 ## Configuration
