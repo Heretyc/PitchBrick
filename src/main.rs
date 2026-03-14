@@ -1,3 +1,4 @@
+#![cfg_attr(windows, windows_subsystem = "windows")]
 /// PitchBrick entry point.
 ///
 /// Parses CLI arguments, initializes logging, computes default window size
