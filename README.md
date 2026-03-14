@@ -15,15 +15,28 @@ A real-time vocal pitch monitor for transgender voice training. PitchBrick displ
 - **Device selection**  pick your microphone and speaker from the menu bar
 - **Window position/size persistence**  remembers where you left it
 
-## Building
+## Installation
 
-Requires Rust 1.70+ (2021 edition).
+### 1. Install Rust (if you don't have it)
+
+Download and run **rustup-init.exe** from [rustup.rs](https://rustup.rs), then follow the prompts. This installs `cargo`, the Rust package manager.
+
+### 2. Install PitchBrick
 
 ```
-cargo build --release
+cargo install pitchbrick
 ```
 
-The binary is at `target/release/pitchbrick.exe`.
+The binary is placed in `%USERPROFILE%\.cargo\bin\pitchbrick.exe`, which is added to your PATH by rustup automatically.
+
+### 3. Add to the Start Menu (optional)
+
+1. Press **Win + R**, type `%USERPROFILE%\.cargo\bin` and press Enter — this opens the folder containing `pitchbrick.exe`
+2. Right-click `pitchbrick.exe` and choose **Create shortcut**
+3. Press **Win + R**, type `shell:programs` and press Enter — this opens your Start Menu programs folder
+4. Move the shortcut you just created into that folder
+
+PitchBrick will now appear in the Start Menu.
 
 ## Usage
 
