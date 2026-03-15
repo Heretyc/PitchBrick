@@ -34,7 +34,7 @@ It won't teach you how to change your voice. But once you're working on pitch, i
 
 ### Recommended: Automatic installer
 
-**[⬇ Download install.bat](https://raw.githubusercontent.com/Heretyc/PitchBrick/main/install.bat)**
+**[⬇ Download install.bat](https://github.com/Heretyc/PitchBrick/releases/latest/download/install.bat)**
 
 Save and run `install.bat`. It checks your system, installs Rust and the required build tools if needed, compiles PitchBrick, and adds it to your Start Menu. No prior Rust knowledge required.
 
