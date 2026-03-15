@@ -32,25 +32,36 @@ It won't teach you how to change your voice. But once you're working on pitch, i
 
 ## Installation
 
-### 1. Install Rust (if you don't have it)
+### Recommended: Automatic installer
+
+**[⬇ Download install.bat](https://raw.githubusercontent.com/Heretyc/PitchBrick/main/install.bat)**
+
+Save and run `install.bat`. It checks your system, installs Rust and the required build tools if needed, compiles PitchBrick, and adds it to your Start Menu. No prior Rust knowledge required.
+
+> **Note:** Windows may show a SmartScreen warning because the script is freshly downloaded. Click **More info → Run anyway** to proceed — the source is this repository.
+
+---
+
+### Manual install
+
+#### 1. Install Rust (if you don't have it)
 
 Download and run **rustup-init.exe** from [rustup.rs](https://rustup.rs), then follow the prompts. This installs `cargo`, the Rust package manager.
 
-### 2. Install PitchBrick
+#### 2. Install PitchBrick
 
-1. Press **Win + R**, type:
 ```
 cargo install pitchbrick
 ```
 
 The binary is placed in `%USERPROFILE%\.cargo\bin\pitchbrick.exe`, which is added to your PATH by rustup automatically.
 
-### 3. Add to the Start Menu (optional)
+#### 3. Add to the Start Menu (optional)
 
-1. Press **Win + R**, type `%USERPROFILE%\.cargo\bin` and press Enter — this opens the folder containing `pitchbrick.exe`
-2. Right-click `pitchbrick.exe` and choose **Create shortcut**
-3. Press **Win + R**, type `shell:programs` and press Enter — this opens your Start Menu programs folder
-4. Move the shortcut you just created into that folder
+1. Press **Win + R**, type `%USERPROFILE%\.cargo\bin` and press Enter
+2. Right-click `pitchbrick.exe` → **Create shortcut**
+3. Press **Win + R**, type `shell:programs` and press Enter
+4. Move the shortcut into that folder
 
 PitchBrick will now appear in the Start Menu.
 
