@@ -222,6 +222,16 @@ pub struct Config {
     /// VR-specific configuration overrides. Created on first toggle of vr_specific_settings.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vr: Option<VrConfig>,
+    /// The last crates.io version we observed during an update check.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub update_last_checked_version: Option<String>,
+    /// ISO date (YYYY-MM-DD) of the last successful update check.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub update_last_checked_date: Option<String>,
+    /// If true, the user has declined the Start Menu shortcut update and
+    /// should never be prompted again.
+    #[serde(default)]
+    pub start_menu_shortcut_declined: bool,
 }
 
 impl Default for Config {
@@ -244,6 +254,9 @@ impl Default for Config {
             vr_overlay_enabled: true,
             vr_specific_settings: false,
             vr: None,
+            update_last_checked_version: None,
+            update_last_checked_date: None,
+            start_menu_shortcut_declined: false,
         }
     }
 }
@@ -272,13 +285,14 @@ impl Config {
     ///
     /// # Returns
     ///
-    /// The loaded (and possibly corrected) configuration, or a default config
-    /// if the file does not exist or cannot be parsed.
-    pub fn load(path: &Path) -> Config {
+    /// A tuple of the loaded (and possibly corrected) configuration and a bool
+    /// indicating whether the config file was freshly created (true) or already
+    /// existed (false).
+    pub fn load(path: &Path) -> (Config, bool) {
         if !path.exists() {
             let config = Config::default();
             config.save(path);
-            return config;
+            return (config, true);
         }
 
         match std::fs::read_to_string(path) {
@@ -291,11 +305,11 @@ impl Config {
                 if let Some(ref mut vr) = config.vr {
                     vr.fix_overlap();
                 }
-                config
+                (config, false)
             }
             Err(e) => {
                 tracing::warn!("Failed to read config file, using defaults: {}", e);
-                Config::default()
+                (Config::default(), false)
             }
         }
     }
@@ -425,6 +439,74 @@ impl Config {
             &self.output_device_name
         }
     }
+
+    /// Returns true if an update check is due (no date recorded or >30 days ago).
+    pub fn is_update_check_due(&self) -> bool {
+        let date_str = match self.update_last_checked_date {
+            Some(ref d) => d,
+            None => return true,
+        };
+        let today = days_since_epoch();
+        let checked = parse_iso_to_days(date_str).unwrap_or(0);
+        today.saturating_sub(checked) > 30
+    }
+
+    /// Returns today's date as an ISO 8601 string (YYYY-MM-DD).
+    pub fn today_iso() -> String {
+        let d = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let days = (d.as_secs() / 86400) as i64;
+        // Simple days-to-date conversion.
+        let (y, m, d) = days_to_ymd(days);
+        format!("{:04}-{:02}-{:02}", y, m, d)
+    }
+}
+
+/// Returns the number of days since the Unix epoch for today.
+fn days_since_epoch() -> u64 {
+    let d = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    d.as_secs() / 86400
+}
+
+/// Parses an ISO 8601 date (YYYY-MM-DD) to days since the Unix epoch.
+fn parse_iso_to_days(s: &str) -> Option<u64> {
+    let parts: Vec<&str> = s.split('-').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let y: i64 = parts[0].parse().ok()?;
+    let m: u32 = parts[1].parse().ok()?;
+    let d: u32 = parts[2].parse().ok()?;
+    Some(ymd_to_days(y, m, d) as u64)
+}
+
+/// Converts a (year, month, day) to days since the Unix epoch.
+fn ymd_to_days(y: i64, m: u32, d: u32) -> i64 {
+    // Algorithm from http://howardhinnant.github.io/date_algorithms.html
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u32;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe as i64 - 719468
+}
+
+/// Converts days since the Unix epoch to (year, month, day).
+fn days_to_ymd(days: i64) -> (i64, u32, u32) {
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
 }
 
 #[cfg(test)]

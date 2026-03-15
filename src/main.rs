@@ -6,8 +6,10 @@
 mod app;
 mod audio;
 mod config;
+mod shortcut;
 mod tray;
 mod ui;
+mod update;
 #[cfg(feature = "vr-overlay")]
 mod vr;
 
@@ -108,7 +110,7 @@ fn main() -> iced::Result {
         side
     );
 
-    let config = config::Config::load(&config::Config::path());
+    let (config, config_is_new) = config::Config::load(&config::Config::path());
     let main_width = config.window_width.unwrap_or(side);
     let main_height = config.window_height.unwrap_or(side);
     let main_position = match (config.window_x, config.window_y) {
@@ -126,6 +128,7 @@ fn main() -> iced::Result {
         move || {
             app::PitchBrick::new(
                 config.clone(),
+                config_is_new,
                 verbose,
                 log_rx_for_app.lock().unwrap().take(),
                 Size::new(main_width, main_height),

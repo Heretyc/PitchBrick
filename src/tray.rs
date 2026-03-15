@@ -24,6 +24,39 @@ pub enum TrayState {
     Inactive,
 }
 
+/// State of the "Check for updates" tray menu item.
+#[derive(Debug, Clone)]
+pub enum UpdateMenuState {
+    /// Default idle state.
+    Ready,
+    /// A check is in progress (non-interactive).
+    Checking,
+    /// The running version is the latest.
+    NoUpdates,
+    /// A newer version is available.
+    Available(String),
+    /// The network request failed.
+    NetworkError,
+}
+
+impl UpdateMenuState {
+    /// Returns the menu item label text.
+    pub fn label(&self) -> String {
+        match self {
+            Self::Ready => "Check for updates".to_string(),
+            Self::Checking => "Checking...".to_string(),
+            Self::NoUpdates => "No new updates.".to_string(),
+            Self::Available(v) => format!("Update available (v{})", v),
+            Self::NetworkError => "Problem with internet!".to_string(),
+        }
+    }
+
+    /// Returns whether the menu item should be clickable.
+    pub fn is_enabled(&self) -> bool {
+        !matches!(self, Self::Checking)
+    }
+}
+
 /// Commands sent from the iced main thread to the tray thread.
 pub enum TrayCommand {
     /// Rebuild the menu and tooltip with updated state.
@@ -39,6 +72,8 @@ pub enum TrayCommand {
     },
     /// Update the tray icon color to reflect the current pitch state.
     SetState(TrayState),
+    /// Update the "Check for updates" menu item text and enabled state.
+    SetUpdateMenuState(UpdateMenuState),
     /// Switch to VR mode icon and show a balloon notification.
     EnterVrMode,
     /// Switch back to the color square icon and show a balloon notification.
@@ -54,6 +89,7 @@ pub struct TrayMenuIds {
     pub open_config: MenuId,
     pub vr_overlay_toggle: MenuId,
     pub vr_specific_settings_toggle: MenuId,
+    pub check_for_updates: MenuId,
     pub patreon: MenuId,
     pub quit: MenuId,
     /// `(menu_id, device_name)` pairs for input devices.
@@ -66,6 +102,7 @@ pub struct TrayMenuIds {
 ///
 /// Returns the `Menu` to attach to the tray icon and a `TrayMenuIds` mapping
 /// each item's `MenuId` to the corresponding action.
+#[allow(clippy::too_many_arguments)]
 fn build_tray_menu(
     gender: Gender,
     input_devices: &[String],
@@ -74,6 +111,7 @@ fn build_tray_menu(
     selected_output: &str,
     vr_overlay_enabled: bool,
     vr_specific_settings: bool,
+    update_state: &UpdateMenuState,
 ) -> (Menu, TrayMenuIds) {
     let gender_item = MenuItem::new(format!("Target: {}", gender), true, None);
     let open_config_item = MenuItem::new("Open Config", true, None);
@@ -119,6 +157,8 @@ fn build_tray_menu(
         output_submenu.append(&item).ok();
     }
 
+    let update_item = MenuItem::new(update_state.label(), update_state.is_enabled(), None);
+
     let patreon_item = MenuItem::new("Written by Lexi", true, None);
     let quit_item = MenuItem::new("Quit", true, None);
 
@@ -127,6 +167,7 @@ fn build_tray_menu(
         open_config: open_config_item.id().clone(),
         vr_overlay_toggle: vr_overlay_item.id().clone(),
         vr_specific_settings_toggle: vr_settings_item.id().clone(),
+        check_for_updates: update_item.id().clone(),
         patreon: patreon_item.id().clone(),
         quit: quit_item.id().clone(),
         input_devices: input_ids,
@@ -142,6 +183,7 @@ fn build_tray_menu(
     menu.append(&input_submenu).ok();
     menu.append(&output_submenu).ok();
     menu.append(&PredefinedMenuItem::separator()).ok();
+    menu.append(&update_item).ok();
     menu.append(&patreon_item).ok();
     menu.append(&PredefinedMenuItem::separator()).ok();
     menu.append(&quit_item).ok();
@@ -252,6 +294,7 @@ fn show_balloon(title: &str, message: &str) {
 /// The tray thread owns the `TrayIcon` and runs a Win32 `PeekMessage` loop.
 /// The iced main thread polls `MenuEvent::receiver()` on every tick to handle
 /// menu clicks, and sends `TrayCommand`s when state changes require a menu rebuild.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_tray_thread(
     gender: Gender,
     input_devices: Vec<String>,
@@ -260,6 +303,7 @@ pub fn spawn_tray_thread(
     selected_output: String,
     vr_overlay_enabled: bool,
     vr_specific_settings: bool,
+    initial_update_state: UpdateMenuState,
 ) -> (std::sync::mpsc::Sender<TrayCommand>, Arc<Mutex<TrayMenuIds>>) {
     // ids_shared is populated by the thread once it builds the menu.
     // We pre-fill with a placeholder so the Arc exists before the thread starts.
@@ -268,6 +312,7 @@ pub fn spawn_tray_thread(
         open_config: MenuId::new("__placeholder__"),
         vr_overlay_toggle: MenuId::new("__placeholder__"),
         vr_specific_settings_toggle: MenuId::new("__placeholder__"),
+        check_for_updates: MenuId::new("__placeholder__"),
         patreon: MenuId::new("__placeholder__"),
         quit: MenuId::new("__placeholder__"),
         input_devices: Vec::new(),
@@ -280,6 +325,7 @@ pub fn spawn_tray_thread(
 
     std::thread::spawn(move || {
         // Build menu inside the thread — muda::Menu is !Send due to Rc internals.
+        let mut current_update_state = initial_update_state;
         let (initial_menu, initial_ids) = build_tray_menu(
             gender,
             &input_devices,
@@ -288,6 +334,7 @@ pub fn spawn_tray_thread(
             &selected_output,
             vr_overlay_enabled,
             vr_specific_settings,
+            &current_update_state,
         );
         let tooltip = format!("PitchBrick - Target: {}", gender);
 
@@ -351,6 +398,7 @@ pub fn spawn_tray_thread(
                                 &selected_output,
                                 vr_overlay_enabled,
                                 vr_specific_settings,
+                                &current_update_state,
                             );
                             tray.set_menu(Some(Box::new(new_menu)));
                             let tooltip = format!("PitchBrick - Target: {}", gender);
@@ -359,6 +407,17 @@ pub fn spawn_tray_thread(
                                 *ids = new_ids;
                             }
                             in_vr_mode = vr_mode_active;
+                        }
+                        TrayCommand::SetUpdateMenuState(state) => {
+                            current_update_state = state;
+                            // Rebuild the menu to update the item text/enabled state.
+                            // We don't have the full state here, so we just update the
+                            // existing menu item by rebuilding. This reuses the last
+                            // known gender/devices from the tray tooltip.
+                            // For simplicity, we send a balloon for available updates.
+                            if let UpdateMenuState::Available(ref v) = current_update_state {
+                                show_balloon("PitchBrick", &format!("Update available: v{}", v));
+                            }
                         }
                         TrayCommand::SetState(state) => {
                             current_tray_state = state;

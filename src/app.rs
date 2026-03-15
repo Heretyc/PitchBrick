@@ -4,13 +4,14 @@
 /// functions that drive the GUI event loop.
 use crate::audio;
 use crate::config::{Config, Gender};
-use crate::tray::{self, TrayCommand, TrayMenuIds, TrayState};
+use crate::tray::{self, TrayCommand, TrayMenuIds, TrayState, UpdateMenuState};
 use crate::ui::display::{lerp_color, DisplayCanvas, DisplayState};
+use crate::update::{self, UpdateCheckResult};
 use iced::widget::canvas::Canvas;
 use iced::window;
 use iced::{Color, Element, Length, Size, Subscription, Task, Theme};
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use tray_icon::menu::MenuId;
 
@@ -47,6 +48,22 @@ pub enum Message {
     ToggleVrSpecificSettings,
     /// User clicked the "Written by Lexi" footer to open the Patreon page.
     OpenPatreon,
+    /// User accepted the update — run cargo install and exit.
+    AcceptUpdate,
+    /// User declined the update — close window, record version.
+    DeclineUpdate,
+    /// The update notification window was opened.
+    UpdateWindowOpened(window::Id),
+    /// Manual "Check for updates" triggered from tray menu.
+    CheckForUpdates,
+    /// Open the crates.io page for PitchBrick.
+    OpenCratesPage,
+    /// User accepted updating the Start Menu shortcut.
+    AcceptShortcutUpdate,
+    /// User declined the Start Menu shortcut update (don't ask again).
+    DeclineShortcutUpdate,
+    /// The shortcut mismatch dialog window was opened.
+    ShortcutWindowOpened(window::Id),
     /// Discards a task result with no side effect.
     Noop,
 }
@@ -106,6 +123,25 @@ pub struct PitchBrick {
     pub vr_overlay_tx: Option<std::sync::mpsc::Sender<crate::vr::VrOverlayCommand>>,
     /// Whether VR mode is currently active.
     pub vr_mode_active: bool,
+    /// Receiver for a pending background update check result.
+    pub update_check_rx: Option<mpsc::Receiver<UpdateCheckResult>>,
+    /// Window ID of the update notification dialog.
+    pub update_window_id: Option<window::Id>,
+    /// The version string of an available update (set when check finds one).
+    pub update_available_version: Option<String>,
+    /// Whether the config file was freshly created on this launch.
+    #[allow(dead_code)]
+    pub config_was_newly_created: bool,
+    /// When the last manual update check was initiated (5s rate limit).
+    pub last_update_check_time: Option<Instant>,
+    /// Current state of the tray "Check for updates" menu item.
+    pub update_menu_state: UpdateMenuState,
+    /// Timer for reverting transient menu states back to Ready.
+    pub no_updates_timer: Option<Instant>,
+    /// Window ID of the Start Menu shortcut mismatch dialog.
+    pub shortcut_window_id: Option<window::Id>,
+    /// Old target path when a shortcut mismatch was detected.
+    pub shortcut_mismatch_old_path: Option<String>,
 }
 
 impl PitchBrick {
@@ -117,6 +153,7 @@ impl PitchBrick {
     /// from the `window::open` return tuple.
     pub fn new(
         config: Config,
+        config_is_new: bool,
         verbose: bool,
         log_rx: Option<std::sync::mpsc::Receiver<String>>,
         main_size: Size,
@@ -200,6 +237,14 @@ impl PitchBrick {
 
         let vr_mode_active = config.is_vr_mode();
 
+        // Determine initial update check state and spawn background check if due.
+        let should_check = config_is_new || config.is_update_check_due();
+        let initial_update_state = if should_check {
+            UpdateMenuState::Checking
+        } else {
+            UpdateMenuState::Ready
+        };
+
         let (tray_command_tx, tray_menu_ids) = tray::spawn_tray_thread(
             config.effective_target_gender(),
             input_devices.clone(),
@@ -208,7 +253,17 @@ impl PitchBrick {
             selected_output,
             config.vr_overlay_enabled,
             config.vr_specific_settings,
+            initial_update_state.clone(),
         );
+
+        let update_check_rx = if should_check {
+            Some(update::spawn_update_check(
+                config.update_last_checked_version.clone(),
+                config_is_new,
+            ))
+        } else {
+            None
+        };
 
         #[cfg(feature = "vr-overlay")]
         let vr_overlay_tx = if config.vr_overlay_enabled {
@@ -247,7 +302,7 @@ impl PitchBrick {
             (None, Task::none())
         };
 
-        let state = PitchBrick {
+        let mut state = PitchBrick {
             config,
             audio_capture,
             reminder_tone,
@@ -275,9 +330,56 @@ impl PitchBrick {
             #[cfg(feature = "vr-overlay")]
             vr_overlay_tx,
             vr_mode_active,
+            update_check_rx,
+            update_window_id: None,
+            update_available_version: None,
+            config_was_newly_created: config_is_new,
+            last_update_check_time: if should_check { Some(now) } else { None },
+            update_menu_state: if should_check {
+                UpdateMenuState::Checking
+            } else {
+                UpdateMenuState::Ready
+            },
+            no_updates_timer: None,
+            shortcut_window_id: None,
+            shortcut_mismatch_old_path: None,
         };
 
-        let init_task = Task::batch([open_main.map(|_| Message::Noop), open_log_task]);
+        // Check Start Menu shortcut and open dialog if mismatched.
+        let shortcut_task = match crate::shortcut::check_and_create_shortcut() {
+            crate::shortcut::ShortcutCheckResult::Created => {
+                tracing::info!("Start Menu shortcut created");
+                Task::none()
+            }
+            crate::shortcut::ShortcutCheckResult::AlreadyCorrect => Task::none(),
+            crate::shortcut::ShortcutCheckResult::Mismatched(old_path) => {
+                if state.config.start_menu_shortcut_declined {
+                    Task::none()
+                } else {
+                    tracing::info!("Start Menu shortcut points to different binary: {}", old_path);
+                    state.shortcut_mismatch_old_path = Some(old_path);
+                    let (win_id, open_task) = window::open(window::Settings {
+                        size: Size::new(460.0, 180.0),
+                        resizable: false,
+                        decorations: true,
+                        exit_on_close_request: true,
+                        ..Default::default()
+                    });
+                    state.shortcut_window_id = Some(win_id);
+                    open_task.map(Message::ShortcutWindowOpened)
+                }
+            }
+            crate::shortcut::ShortcutCheckResult::Failed(e) => {
+                tracing::warn!("Start Menu shortcut check failed: {}", e);
+                Task::none()
+            }
+        };
+
+        let init_task = Task::batch([
+            open_main.map(|_| Message::Noop),
+            open_log_task,
+            shortcut_task,
+        ]);
 
         (state, init_task)
     }
@@ -417,7 +519,7 @@ impl PitchBrick {
                             };
                             if changed {
                                 self.config_last_modified = Some(modified);
-                                let mut new_config = Config::load(&config_path);
+                                let (mut new_config, _) = Config::load(&config_path);
                                 new_config.fix_overlap();
                                 if let Some(ref mut vr) = new_config.vr {
                                     vr.fix_overlap();
@@ -439,6 +541,82 @@ impl PitchBrick {
                     }
                 }
 
+                // --- Update check: poll background result ---
+                let mut update_task = Task::none();
+                if let Some(ref rx) = self.update_check_rx {
+                    if let Ok(result) = rx.try_recv() {
+                        self.update_check_rx = None;
+                        match result {
+                            UpdateCheckResult::Available(version) => {
+                                self.update_available_version = Some(version.clone());
+                                self.update_menu_state = UpdateMenuState::Available(version.clone());
+                                let _ = self.tray_command_tx.send(TrayCommand::SetUpdateMenuState(
+                                    UpdateMenuState::Available(version),
+                                ));
+                                self.send_tray_rebuild();
+                                // Save check date and version.
+                                self.config.update_last_checked_date = Some(Config::today_iso());
+                                self.config.update_last_checked_version =
+                                    self.update_available_version.clone();
+                                self.config.save(&Config::path());
+                                self.config_last_modified = std::fs::metadata(Config::path())
+                                    .ok()
+                                    .and_then(|m| m.modified().ok());
+                                // Open the update notification window.
+                                let (win_id, open_task) = window::open(window::Settings {
+                                    size: Size::new(340.0, 160.0),
+                                    resizable: false,
+                                    decorations: true,
+                                    exit_on_close_request: true,
+                                    ..Default::default()
+                                });
+                                self.update_window_id = Some(win_id);
+                                update_task = open_task.map(Message::UpdateWindowOpened);
+                            }
+                            UpdateCheckResult::UpToDate => {
+                                self.update_menu_state = UpdateMenuState::NoUpdates;
+                                let _ = self.tray_command_tx.send(TrayCommand::SetUpdateMenuState(
+                                    UpdateMenuState::NoUpdates,
+                                ));
+                                self.send_tray_rebuild();
+                                self.no_updates_timer = Some(now);
+                                // Save check date.
+                                self.config.update_last_checked_date = Some(Config::today_iso());
+                                self.config.save(&Config::path());
+                                self.config_last_modified = std::fs::metadata(Config::path())
+                                    .ok()
+                                    .and_then(|m| m.modified().ok());
+                            }
+                            UpdateCheckResult::Failed => {
+                                self.update_menu_state = UpdateMenuState::NetworkError;
+                                let _ = self.tray_command_tx.send(TrayCommand::SetUpdateMenuState(
+                                    UpdateMenuState::NetworkError,
+                                ));
+                                self.send_tray_rebuild();
+                                self.no_updates_timer = Some(now);
+                                // Don't save date — retry next time.
+                            }
+                        }
+                    }
+                }
+
+                // --- Update menu state revert timer ---
+                if let Some(timer_start) = self.no_updates_timer {
+                    let elapsed = now.duration_since(timer_start);
+                    let timeout = match self.update_menu_state {
+                        UpdateMenuState::NetworkError => Duration::from_secs(15),
+                        _ => Duration::from_secs(30),
+                    };
+                    if elapsed >= timeout {
+                        self.no_updates_timer = None;
+                        self.update_menu_state = UpdateMenuState::Ready;
+                        let _ = self
+                            .tray_command_tx
+                            .send(TrayCommand::SetUpdateMenuState(UpdateMenuState::Ready));
+                        self.send_tray_rebuild();
+                    }
+                }
+
                 // --- Log window: drain incoming lines and snap to bottom ---
                 let mut log_updated = false;
                 if let Some(ref rx) = self.log_rx {
@@ -447,14 +625,16 @@ impl PitchBrick {
                         log_updated = true;
                     }
                 }
-                if log_updated {
+                let log_task = if log_updated {
                     iced::widget::operation::snap_to(
                         crate::ui::log_window::scroll_id(),
                         iced::widget::operation::RelativeOffset { x: 0.0, y: 1.0 },
                     )
                 } else {
                     Task::none()
-                }
+                };
+
+                Task::batch([update_task, log_task])
             }
             Message::DragWindow => {
                 if let Some(id) = self.window_id {
@@ -571,6 +751,29 @@ impl PitchBrick {
                 } else if menu_id == ids.vr_specific_settings_toggle {
                     drop(ids);
                     return self.update(Message::ToggleVrSpecificSettings);
+                } else if menu_id == ids.check_for_updates {
+                    drop(ids);
+                    // Dispatch based on current update menu state.
+                    return match &self.update_menu_state {
+                        UpdateMenuState::Available(v) => {
+                            // Re-open update window if not already open.
+                            if self.update_window_id.is_some() {
+                                Task::none()
+                            } else {
+                                self.update_available_version = Some(v.clone());
+                                let (win_id, open_task) = window::open(window::Settings {
+                                    size: Size::new(340.0, 160.0),
+                                    resizable: false,
+                                    decorations: true,
+                                    exit_on_close_request: true,
+                                    ..Default::default()
+                                });
+                                self.update_window_id = Some(win_id);
+                                open_task.map(Message::UpdateWindowOpened)
+                            }
+                        }
+                        _ => self.update(Message::CheckForUpdates),
+                    };
                 } else if menu_id == ids.patreon {
                     drop(ids);
                     return self.update(Message::OpenPatreon);
@@ -665,6 +868,109 @@ impl PitchBrick {
             Message::OpenPatreon => {
                 let _ = std::process::Command::new("cmd")
                     .args(["/c", "start", "", "https://www.patreon.com/cw/lexi_bytes"])
+                    .spawn();
+                Task::none()
+            }
+            Message::AcceptUpdate => {
+                // Save version+date before exiting.
+                self.config.update_last_checked_date = Some(Config::today_iso());
+                self.config.update_last_checked_version = self.update_available_version.clone();
+                self.config.save(&Config::path());
+                update::spawn_update_and_exit();
+            }
+            Message::DeclineUpdate => {
+                // Save version+date so we don't re-prompt for this version.
+                self.config.update_last_checked_date = Some(Config::today_iso());
+                self.config.update_last_checked_version = self.update_available_version.clone();
+                self.config.save(&Config::path());
+                self.config_last_modified = std::fs::metadata(Config::path())
+                    .ok()
+                    .and_then(|m| m.modified().ok());
+                // Close the update window.
+                let task = if let Some(id) = self.update_window_id.take() {
+                    window::close(id)
+                } else {
+                    Task::none()
+                };
+                self.update_available_version = None;
+                self.update_menu_state = UpdateMenuState::Ready;
+                let _ = self
+                    .tray_command_tx
+                    .send(TrayCommand::SetUpdateMenuState(UpdateMenuState::Ready));
+                self.send_tray_rebuild();
+                task
+            }
+            Message::UpdateWindowOpened(id) => {
+                self.update_window_id = Some(id);
+                Task::none()
+            }
+            Message::AcceptShortcutUpdate => {
+                if let Err(e) = crate::shortcut::update_shortcut() {
+                    tracing::error!("Failed to update Start Menu shortcut: {}", e);
+                }
+                let task = if let Some(id) = self.shortcut_window_id.take() {
+                    window::close(id)
+                } else {
+                    Task::none()
+                };
+                self.shortcut_mismatch_old_path = None;
+                task
+            }
+            Message::DeclineShortcutUpdate => {
+                self.config.start_menu_shortcut_declined = true;
+                self.config.save(&Config::path());
+                self.config_last_modified = std::fs::metadata(Config::path())
+                    .ok()
+                    .and_then(|m| m.modified().ok());
+                let task = if let Some(id) = self.shortcut_window_id.take() {
+                    window::close(id)
+                } else {
+                    Task::none()
+                };
+                self.shortcut_mismatch_old_path = None;
+                task
+            }
+            Message::ShortcutWindowOpened(id) => {
+                self.shortcut_window_id = Some(id);
+                Task::none()
+            }
+            Message::CheckForUpdates => {
+                // Rate limit: ignore if a check is already in progress.
+                if self.update_check_rx.is_some() {
+                    return Task::none();
+                }
+                // Rate limit: ignore if last check was <5s ago.
+                if let Some(last) = self.last_update_check_time {
+                    if Instant::now().duration_since(last) < Duration::from_secs(5) {
+                        return Task::none();
+                    }
+                }
+                // Close update window if open.
+                let close_task = if let Some(id) = self.update_window_id.take() {
+                    self.update_available_version = None;
+                    window::close(id)
+                } else {
+                    Task::none()
+                };
+                // Spawn a fresh check (no last_observed — force comparison against current).
+                self.update_check_rx = Some(update::spawn_update_check(None, false));
+                self.update_menu_state = UpdateMenuState::Checking;
+                self.last_update_check_time = Some(Instant::now());
+                self.no_updates_timer = None;
+                let _ = self
+                    .tray_command_tx
+                    .send(TrayCommand::SetUpdateMenuState(UpdateMenuState::Checking));
+                self.send_tray_rebuild();
+                close_task
+            }
+            Message::OpenCratesPage => {
+                let _ = std::process::Command::new("cmd")
+                    .args([
+                        "/c",
+                        "start",
+                        "",
+                        "https://crates.io/crates/pitchbrick",
+                    ])
                     .spawn();
                 Task::none()
             }
@@ -814,7 +1120,11 @@ impl PitchBrick {
 
     /// Returns a per-window title.
     pub fn title(&self, id: window::Id) -> String {
-        if Some(id) == self.log_window_id {
+        if Some(id) == self.update_window_id {
+            "PitchBrick - Update".to_string()
+        } else if Some(id) == self.shortcut_window_id {
+            "PitchBrick - Shortcut".to_string()
+        } else if Some(id) == self.log_window_id {
             "PitchBrick - Log".to_string()
         } else {
             "PitchBrick".to_string()
@@ -826,6 +1136,20 @@ impl PitchBrick {
     /// Main window: borderless colour-indicator canvas.
     /// Log window (verbose mode): scrollable monospace log lines.
     pub fn view(&self, id: window::Id) -> Element<'_, Message> {
+        if Some(id) == self.update_window_id {
+            let new_ver = self
+                .update_available_version
+                .as_deref()
+                .unwrap_or("?");
+            return crate::ui::update_window::view(new_ver, update::current_version());
+        }
+        if Some(id) == self.shortcut_window_id {
+            let old = self.shortcut_mismatch_old_path.as_deref().unwrap_or("?");
+            let current = std::env::current_exe()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| "?".into());
+            return crate::ui::shortcut_window::view(old, &current);
+        }
         if Some(id) == self.log_window_id {
             crate::ui::log_window::view(&self.log_lines)
         } else {
