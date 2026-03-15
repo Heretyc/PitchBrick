@@ -34,9 +34,15 @@ pub enum TrayCommand {
         selected_input: String,
         selected_output: String,
         vr_overlay_enabled: bool,
+        vr_specific_settings: bool,
+        vr_mode_active: bool,
     },
     /// Update the tray icon color to reflect the current pitch state.
     SetState(TrayState),
+    /// Switch to VR mode icon and show a balloon notification.
+    EnterVrMode,
+    /// Switch back to the color square icon and show a balloon notification.
+    LeaveVrMode,
     /// Shut down the tray icon and exit the message loop.
     Quit,
 }
@@ -47,6 +53,7 @@ pub struct TrayMenuIds {
     pub gender_toggle: MenuId,
     pub open_config: MenuId,
     pub vr_overlay_toggle: MenuId,
+    pub vr_specific_settings_toggle: MenuId,
     pub patreon: MenuId,
     pub quit: MenuId,
     /// `(menu_id, device_name)` pairs for input devices.
@@ -66,6 +73,7 @@ fn build_tray_menu(
     selected_input: &str,
     selected_output: &str,
     vr_overlay_enabled: bool,
+    vr_specific_settings: bool,
 ) -> (Menu, TrayMenuIds) {
     let gender_item = MenuItem::new(format!("Target: {}", gender), true, None);
     let open_config_item = MenuItem::new("Open Config", true, None);
@@ -75,6 +83,13 @@ fn build_tray_menu(
         "  Toggle SteamVR Overlay"
     };
     let vr_overlay_item = MenuItem::new(vr_label, true, None);
+
+    let vr_settings_label = if vr_specific_settings {
+        "✓ Allow VR Specific Settings"
+    } else {
+        "  Allow VR Specific Settings"
+    };
+    let vr_settings_item = MenuItem::new(vr_settings_label, vr_overlay_enabled, None);
 
     let input_submenu = Submenu::new("Input Device", true);
     let mut input_ids = Vec::new();
@@ -111,6 +126,7 @@ fn build_tray_menu(
         gender_toggle: gender_item.id().clone(),
         open_config: open_config_item.id().clone(),
         vr_overlay_toggle: vr_overlay_item.id().clone(),
+        vr_specific_settings_toggle: vr_settings_item.id().clone(),
         patreon: patreon_item.id().clone(),
         quit: quit_item.id().clone(),
         input_devices: input_ids,
@@ -121,6 +137,7 @@ fn build_tray_menu(
     menu.append(&gender_item).ok();
     menu.append(&open_config_item).ok();
     menu.append(&vr_overlay_item).ok();
+    menu.append(&vr_settings_item).ok();
     menu.append(&PredefinedMenuItem::separator()).ok();
     menu.append(&input_submenu).ok();
     menu.append(&output_submenu).ok();
@@ -147,6 +164,88 @@ fn create_icon(state: TrayState) -> tray_icon::Icon {
     tray_icon::Icon::from_rgba(rgba, side, side).expect("Failed to create tray icon")
 }
 
+/// Creates a 32×32 VR mode icon. Attempts to load `docs/vr-mode.ico` from
+/// the exe's directory; falls back to a purple square if the file is missing.
+fn create_vr_icon() -> tray_icon::Icon {
+    if let Ok(exe) = std::env::current_exe() {
+        let ico_path = exe.with_file_name("vr-mode.ico");
+        if ico_path.exists() {
+            if let Ok(icon) = tray_icon::Icon::from_path(&ico_path, Some((32, 32))) {
+                return icon;
+            }
+        }
+        // Also try docs/ relative to exe dir.
+        if let Some(parent) = exe.parent() {
+            let ico_path = parent.join("docs").join("vr-mode.ico");
+            if ico_path.exists() {
+                if let Ok(icon) = tray_icon::Icon::from_path(&ico_path, Some((32, 32))) {
+                    return icon;
+                }
+            }
+        }
+    }
+    // Fallback: purple square.
+    let side = 32u32;
+    let color: [u8; 4] = [0x9C, 0x27, 0xB0, 0xFF];
+    let mut rgba = Vec::with_capacity((side * side * 4) as usize);
+    for _ in 0..(side * side) {
+        rgba.extend_from_slice(&color);
+    }
+    tray_icon::Icon::from_rgba(rgba, side, side).expect("Failed to create VR icon")
+}
+
+/// Shows a balloon (toast) notification via the Win32 Shell_NotifyIconW API.
+#[cfg(windows)]
+fn show_balloon(title: &str, message: &str) {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::UI::Shell::{
+        Shell_NotifyIconW, NIF_INFO, NIM_MODIFY, NOTIFYICONDATAW, NOTIFY_ICON_DATA_FLAGS,
+    };
+    let mut nid = NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        uID: 1, // tray-icon crate uses uID = 1 for its first icon
+        uFlags: NIF_INFO | NOTIFY_ICON_DATA_FLAGS(0),
+        ..Default::default()
+    };
+
+    // Copy title into szInfoTitle (max 63 chars + null).
+    let title_wide: Vec<u16> = OsStr::new(title).encode_wide().collect();
+    let title_len = title_wide.len().min(nid.szInfoTitle.len() - 1);
+    nid.szInfoTitle[..title_len].copy_from_slice(&title_wide[..title_len]);
+
+    // Copy message into szInfo (max 255 chars + null).
+    let msg_wide: Vec<u16> = OsStr::new(message).encode_wide().collect();
+    let msg_len = msg_wide.len().min(nid.szInfo.len() - 1);
+    nid.szInfo[..msg_len].copy_from_slice(&msg_wide[..msg_len]);
+
+    // Find the tray-icon crate's hidden HWND via FindWindowW.
+    use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
+    use windows::core::PCWSTR;
+
+    let hwnd = unsafe {
+        let class_name: Vec<u16> = OsStr::new("tray-icon-window")
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        FindWindowW(PCWSTR(class_name.as_ptr()), PCWSTR::null())
+    };
+
+    let hwnd = match hwnd {
+        Ok(h) if !h.0.is_null() => h,
+        _ => {
+            tracing::debug!("Balloon: could not find tray HWND, skipping notification");
+            return;
+        }
+    };
+
+    nid.hWnd = hwnd;
+    let result = unsafe { Shell_NotifyIconW(NIM_MODIFY, &nid) };
+    if !result.as_bool() {
+        tracing::debug!("Balloon: Shell_NotifyIconW NIM_MODIFY failed");
+    }
+}
+
 /// Spawns the tray icon background thread and returns a command sender and
 /// a shared reference to the current menu IDs.
 ///
@@ -160,6 +259,7 @@ pub fn spawn_tray_thread(
     selected_input: String,
     selected_output: String,
     vr_overlay_enabled: bool,
+    vr_specific_settings: bool,
 ) -> (std::sync::mpsc::Sender<TrayCommand>, Arc<Mutex<TrayMenuIds>>) {
     // ids_shared is populated by the thread once it builds the menu.
     // We pre-fill with a placeholder so the Arc exists before the thread starts.
@@ -167,6 +267,7 @@ pub fn spawn_tray_thread(
         gender_toggle: MenuId::new("__placeholder__"),
         open_config: MenuId::new("__placeholder__"),
         vr_overlay_toggle: MenuId::new("__placeholder__"),
+        vr_specific_settings_toggle: MenuId::new("__placeholder__"),
         patreon: MenuId::new("__placeholder__"),
         quit: MenuId::new("__placeholder__"),
         input_devices: Vec::new(),
@@ -186,6 +287,7 @@ pub fn spawn_tray_thread(
             &selected_input,
             &selected_output,
             vr_overlay_enabled,
+            vr_specific_settings,
         );
         let tooltip = format!("PitchBrick - Target: {}", gender);
 
@@ -202,6 +304,10 @@ pub fn spawn_tray_thread(
             .with_icon(icon)
             .build()
             .expect("Failed to create tray icon");
+
+        // Track VR mode for icon management.
+        let mut in_vr_mode = false;
+        let mut current_tray_state = TrayState::Inactive;
 
         // Win32 polling message loop.
         #[cfg(windows)]
@@ -234,6 +340,8 @@ pub fn spawn_tray_thread(
                             selected_input,
                             selected_output,
                             vr_overlay_enabled,
+                            vr_specific_settings,
+                            vr_mode_active,
                         } => {
                             let (new_menu, new_ids) = build_tray_menu(
                                 gender,
@@ -242,6 +350,7 @@ pub fn spawn_tray_thread(
                                 &selected_input,
                                 &selected_output,
                                 vr_overlay_enabled,
+                                vr_specific_settings,
                             );
                             tray.set_menu(Some(Box::new(new_menu)));
                             let tooltip = format!("PitchBrick - Target: {}", gender);
@@ -249,9 +358,23 @@ pub fn spawn_tray_thread(
                             if let Ok(mut ids) = ids_for_thread.lock() {
                                 *ids = new_ids;
                             }
+                            in_vr_mode = vr_mode_active;
                         }
                         TrayCommand::SetState(state) => {
-                            tray.set_icon(Some(create_icon(state))).ok();
+                            current_tray_state = state;
+                            if !in_vr_mode {
+                                tray.set_icon(Some(create_icon(state))).ok();
+                            }
+                        }
+                        TrayCommand::EnterVrMode => {
+                            in_vr_mode = true;
+                            tray.set_icon(Some(create_vr_icon())).ok();
+                            show_balloon("PitchBrick", "VR mode activated");
+                        }
+                        TrayCommand::LeaveVrMode => {
+                            in_vr_mode = false;
+                            tray.set_icon(Some(create_icon(current_tray_state))).ok();
+                            show_balloon("PitchBrick", "VR mode deactivated");
                         }
                         TrayCommand::Quit => {
                             unsafe {
@@ -272,7 +395,18 @@ pub fn spawn_tray_thread(
                 match rx.recv() {
                     Ok(TrayCommand::Quit) | Err(_) => break,
                     Ok(TrayCommand::SetState(state)) => {
-                        tray.set_icon(Some(create_icon(state))).ok();
+                        current_tray_state = state;
+                        if !in_vr_mode {
+                            tray.set_icon(Some(create_icon(state))).ok();
+                        }
+                    }
+                    Ok(TrayCommand::EnterVrMode) => {
+                        in_vr_mode = true;
+                        tray.set_icon(Some(create_vr_icon())).ok();
+                    }
+                    Ok(TrayCommand::LeaveVrMode) => {
+                        in_vr_mode = false;
+                        tray.set_icon(Some(create_icon(current_tray_state))).ok();
                     }
                     _ => {}
                 }

@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tray_icon::menu::MenuId;
 
+
 /// All possible messages (events) in the PitchBrick application.
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -42,6 +43,8 @@ pub enum Message {
     LogWindowOpened(window::Id),
     /// User toggled the VR overlay on/off from the tray menu.
     ToggleVrOverlay,
+    /// User toggled VR-specific settings on/off from the tray menu.
+    ToggleVrSpecificSettings,
     /// User clicked the "Written by Lexi" footer to open the Patreon page.
     OpenPatreon,
     /// Discards a task result with no side effect.
@@ -101,6 +104,8 @@ pub struct PitchBrick {
     /// Command sender for the VR overlay thread (None if VR unavailable or disabled).
     #[cfg(feature = "vr-overlay")]
     pub vr_overlay_tx: Option<std::sync::mpsc::Sender<crate::vr::VrOverlayCommand>>,
+    /// Whether VR mode is currently active.
+    pub vr_mode_active: bool,
 }
 
 impl PitchBrick {
@@ -119,7 +124,8 @@ impl PitchBrick {
     ) -> (Self, Task<Message>) {
         let audio_buffer = Arc::new(Mutex::new(VecDeque::new()));
 
-        let input_device = audio::devices::find_input_device(&config.input_device_name);
+        let effective_input = config.effective_input_device();
+        let input_device = audio::devices::find_input_device(effective_input);
         let (audio_capture, sample_rate) = match input_device {
             Some(ref dev) => {
                 match audio::capture::AudioCapture::new(dev, audio_buffer.clone()) {
@@ -139,13 +145,14 @@ impl PitchBrick {
             }
         };
 
-        let output_device = audio::devices::find_output_device(&config.output_device_name);
+        let effective_output = config.effective_output_device();
+        let output_device = audio::devices::find_output_device(effective_output);
         let reminder_tone = match output_device {
             Some(ref dev) => {
                 match audio::playback::ReminderTone::new(
                     dev,
-                    config.reminder_tone_freq,
-                    config.reminder_tone_volume,
+                    config.effective_reminder_tone_freq(),
+                    config.effective_reminder_tone_volume(),
                 ) {
                     Ok(tone) => Some(tone),
                     Err(e) => {
@@ -160,14 +167,8 @@ impl PitchBrick {
             }
         };
 
-        let input_devices: Vec<String> = audio::devices::enumerate_input_devices()
-            .into_iter()
-            .map(|d| d.name)
-            .collect();
-        let output_devices: Vec<String> = audio::devices::enumerate_output_devices()
-            .into_iter()
-            .map(|d| d.name)
-            .collect();
+        let input_devices = audio::devices::enumerate_input_devices();
+        let output_devices = audio::devices::enumerate_output_devices();
 
         tracing::info!(
             "Audio: capture={}, tone={}, inputs={}, outputs={}",
@@ -186,18 +187,38 @@ impl PitchBrick {
             .ok()
             .and_then(|m| m.modified().ok());
 
+        let selected_input = if config.effective_input_device().is_empty() {
+            audio::devices::default_input_display_name().unwrap_or_default()
+        } else {
+            config.effective_input_device().to_string()
+        };
+        let selected_output = if config.effective_output_device().is_empty() {
+            audio::devices::default_output_display_name().unwrap_or_default()
+        } else {
+            config.effective_output_device().to_string()
+        };
+
+        let vr_mode_active = config.is_vr_mode();
+
         let (tray_command_tx, tray_menu_ids) = tray::spawn_tray_thread(
-            config.target_gender,
+            config.effective_target_gender(),
             input_devices.clone(),
             output_devices.clone(),
-            config.input_device_name.clone(),
-            config.output_device_name.clone(),
+            selected_input,
+            selected_output,
             config.vr_overlay_enabled,
+            config.vr_specific_settings,
         );
 
         #[cfg(feature = "vr-overlay")]
         let vr_overlay_tx = if config.vr_overlay_enabled {
-            crate::vr::spawn_vr_overlay_thread()
+            let vr = config.vr.as_ref();
+            crate::vr::spawn_vr_overlay_thread(
+                vr.and_then(|v| v.vr_x),
+                vr.and_then(|v| v.vr_y),
+                vr.and_then(|v| v.vr_width),
+                vr.and_then(|v| v.vr_height),
+            )
         } else {
             None
         };
@@ -253,6 +274,7 @@ impl PitchBrick {
             log_rx,
             #[cfg(feature = "vr-overlay")]
             vr_overlay_tx,
+            vr_mode_active,
         };
 
         let init_task = Task::batch([open_main.map(|_| Message::Noop), open_log_task]);
@@ -276,15 +298,11 @@ impl PitchBrick {
 
                     let new_state = match last {
                         Some(freq) if (85.0..=350.0).contains(&freq) => {
-                            let (low, high) = self.config.target_range();
+                            let (low, high) = self.config.effective_target_range();
                             if freq >= low && freq <= high {
                                 DisplayState::Green
                             } else {
-                                // Only flag Red when the voice is going the wrong direction.
-                                // Going further in the good direction is still Green:
-                                //   Female: higher than target is fine (more feminine)
-                                //   Male:   lower than target is fine (more masculine)
-                                let good_direction = match self.config.target_gender {
+                                let good_direction = match self.config.effective_target_gender() {
                                     Gender::Female => freq > high,
                                     Gender::Male => freq < low,
                                 };
@@ -326,9 +344,10 @@ impl PitchBrick {
                         #[cfg(feature = "vr-overlay")]
                         if let Some(ref tx) = self.vr_overlay_tx {
                             let rgba = match new_state {
-                                DisplayState::Green => [0x4C, 0xAF, 0x50, 0xFF],
+                                DisplayState::Green | DisplayState::Black => {
+                                    [0x4C, 0xAF, 0x50, 0xFF]
+                                }
                                 DisplayState::Red => [0xF4, 0x43, 0x36, 0xFF],
-                                DisplayState::Black => [0x60, 0x60, 0x60, 0xFF],
                             };
                             let _ = tx.send(crate::vr::VrOverlayCommand::SetColor(rgba));
                         }
@@ -343,7 +362,7 @@ impl PitchBrick {
                         }
                         if let Some(red_start) = self.red_since {
                             let elapsed = now.duration_since(red_start).as_secs_f32();
-                            if elapsed >= self.config.red_duration_seconds {
+                            if elapsed >= self.config.effective_red_duration() {
                                 if let Some(ref tone) = self.reminder_tone {
                                     if !tone.is_playing() {
                                         tone.start();
@@ -400,15 +419,19 @@ impl PitchBrick {
                                 self.config_last_modified = Some(modified);
                                 let mut new_config = Config::load(&config_path);
                                 new_config.fix_overlap();
+                                if let Some(ref mut vr) = new_config.vr {
+                                    vr.fix_overlap();
+                                }
                                 new_config.save(&config_path);
                                 self.config_last_modified = std::fs::metadata(&config_path)
                                     .ok()
                                     .and_then(|m| m.modified().ok());
                                 self.config = new_config;
                                 if let Some(ref tone) = self.reminder_tone {
-                                    tone.set_frequency(self.config.reminder_tone_freq);
-                                    tone.set_volume(self.config.reminder_tone_volume);
+                                    tone.set_frequency(self.config.effective_reminder_tone_freq());
+                                    tone.set_volume(self.config.effective_reminder_tone_volume());
                                 }
+                                self.handle_vr_mode_transition();
                                 self.send_tray_rebuild();
                                 tracing::info!("Config hot-reloaded from disk");
                             }
@@ -494,8 +517,8 @@ impl PitchBrick {
                 if let Some(ref dev) = device {
                     match audio::playback::ReminderTone::new(
                         dev,
-                        self.config.reminder_tone_freq,
-                        self.config.reminder_tone_volume,
+                        self.config.effective_reminder_tone_freq(),
+                        self.config.effective_reminder_tone_volume(),
                     ) {
                         Ok(tone) => {
                             self.reminder_tone = Some(tone);
@@ -545,6 +568,9 @@ impl PitchBrick {
                 } else if menu_id == ids.vr_overlay_toggle {
                     drop(ids);
                     return self.update(Message::ToggleVrOverlay);
+                } else if menu_id == ids.vr_specific_settings_toggle {
+                    drop(ids);
+                    return self.update(Message::ToggleVrSpecificSettings);
                 } else if menu_id == ids.patreon {
                     drop(ids);
                     return self.update(Message::OpenPatreon);
@@ -577,24 +603,48 @@ impl PitchBrick {
                 #[cfg(feature = "vr-overlay")]
                 {
                     if self.config.vr_overlay_enabled {
-                        // Spawn VR thread and send current color.
-                        self.vr_overlay_tx = crate::vr::spawn_vr_overlay_thread();
+                        let vr = self.config.vr.as_ref();
+                        self.vr_overlay_tx = crate::vr::spawn_vr_overlay_thread(
+                            vr.and_then(|v| v.vr_x),
+                            vr.and_then(|v| v.vr_y),
+                            vr.and_then(|v| v.vr_width),
+                            vr.and_then(|v| v.vr_height),
+                        );
                         if let Some(ref tx) = self.vr_overlay_tx {
+                            // VR overlay stays green unless actively Red.
                             let rgba = match self.display_state {
-                                DisplayState::Green => [0x4C, 0xAF, 0x50, 0xFF],
                                 DisplayState::Red => [0xF4, 0x43, 0x36, 0xFF],
-                                DisplayState::Black => [0x60, 0x60, 0x60, 0xFF],
+                                _ => [0x4C, 0xAF, 0x50, 0xFF],
                             };
                             let _ = tx.send(crate::vr::VrOverlayCommand::SetColor(rgba));
                         }
-                    } else {
-                        // Shut down VR thread.
-                        if let Some(tx) = self.vr_overlay_tx.take() {
-                            let _ = tx.send(crate::vr::VrOverlayCommand::Quit);
-                        }
+                    } else if let Some(tx) = self.vr_overlay_tx.take() {
+                        let _ = tx.send(crate::vr::VrOverlayCommand::Quit);
                     }
                 }
 
+                self.handle_vr_mode_transition();
+                self.send_tray_rebuild();
+                Task::none()
+            }
+            Message::ToggleVrSpecificSettings => {
+                self.config.vr_specific_settings = !self.config.vr_specific_settings;
+
+                // Create VR config from desktop on first enable.
+                if self.config.vr_specific_settings && self.config.vr.is_none() {
+                    self.config.vr = Some(crate::config::VrConfig::from_desktop(&self.config));
+                    tracing::info!("Created VR config from desktop settings");
+                }
+
+                self.config.save(&Config::path());
+                self.config_last_modified = std::fs::metadata(Config::path())
+                    .ok()
+                    .and_then(|m| m.modified().ok());
+                tracing::info!(
+                    "VR specific settings toggled to {}",
+                    self.config.vr_specific_settings
+                );
+                self.handle_vr_mode_transition();
                 self.send_tray_rebuild();
                 Task::none()
             }
@@ -622,15 +672,143 @@ impl PitchBrick {
         }
     }
 
+    /// Detects VR mode transitions and sends appropriate tray commands.
+    ///
+    /// When entering VR mode: switches tray icon, recreates audio if VR devices differ.
+    /// When leaving VR mode: restores tray icon, recreates audio if desktop devices differ.
+    fn handle_vr_mode_transition(&mut self) {
+        let new_vr_mode = self.config.is_vr_mode();
+        if new_vr_mode == self.vr_mode_active {
+            return;
+        }
+
+        if new_vr_mode {
+            // Entering VR mode.
+            self.vr_mode_active = true;
+            let _ = self.tray_command_tx.send(TrayCommand::EnterVrMode);
+            tracing::info!("Entering VR mode");
+
+            if let Some(ref vr) = self.config.vr {
+                // Recreate input device if different.
+                if vr.input_device_name != self.config.input_device_name {
+                    self.audio_capture = None;
+                    let device = audio::devices::find_input_device(&vr.input_device_name);
+                    if let Some(ref dev) = device {
+                        match audio::capture::AudioCapture::new(dev, self.audio_buffer.clone()) {
+                            Ok(capture) => {
+                                self.sample_rate = capture.sample_rate;
+                                self.audio_capture = Some(capture);
+                                self.analysis_worker = audio::analysis::AnalysisWorker::spawn(
+                                    self.audio_buffer.clone(),
+                                    self.sample_rate,
+                                );
+                            }
+                            Err(e) => tracing::error!("Failed to create VR audio capture: {}", e),
+                        }
+                    }
+                }
+
+                // Recreate output device if different.
+                if vr.output_device_name != self.config.output_device_name {
+                    self.reminder_tone = None;
+                    let device = audio::devices::find_output_device(&vr.output_device_name);
+                    if let Some(ref dev) = device {
+                        match audio::playback::ReminderTone::new(
+                            dev,
+                            vr.reminder_tone_freq,
+                            vr.reminder_tone_volume,
+                        ) {
+                            Ok(tone) => self.reminder_tone = Some(tone),
+                            Err(e) => tracing::error!("Failed to create VR reminder tone: {}", e),
+                        }
+                    }
+                } else if let Some(ref tone) = self.reminder_tone {
+                    tone.set_frequency(vr.reminder_tone_freq);
+                    tone.set_volume(vr.reminder_tone_volume);
+                }
+            }
+        } else {
+            // Leaving VR mode.
+            self.vr_mode_active = false;
+            let _ = self.tray_command_tx.send(TrayCommand::LeaveVrMode);
+            tracing::info!("Leaving VR mode");
+
+            // Check if we need to switch back to desktop devices.
+            let vr_input = self
+                .config
+                .vr
+                .as_ref()
+                .map(|v| v.input_device_name.as_str())
+                .unwrap_or("");
+            let vr_output = self
+                .config
+                .vr
+                .as_ref()
+                .map(|v| v.output_device_name.as_str())
+                .unwrap_or("");
+
+            if vr_input != self.config.input_device_name {
+                self.audio_capture = None;
+                let device = audio::devices::find_input_device(&self.config.input_device_name);
+                if let Some(ref dev) = device {
+                    match audio::capture::AudioCapture::new(dev, self.audio_buffer.clone()) {
+                        Ok(capture) => {
+                            self.sample_rate = capture.sample_rate;
+                            self.audio_capture = Some(capture);
+                            self.analysis_worker = audio::analysis::AnalysisWorker::spawn(
+                                self.audio_buffer.clone(),
+                                self.sample_rate,
+                            );
+                        }
+                        Err(e) => tracing::error!("Failed to restore desktop audio capture: {}", e),
+                    }
+                }
+            }
+
+            if vr_output != self.config.output_device_name {
+                self.reminder_tone = None;
+                let device = audio::devices::find_output_device(&self.config.output_device_name);
+                if let Some(ref dev) = device {
+                    match audio::playback::ReminderTone::new(
+                        dev,
+                        self.config.reminder_tone_freq,
+                        self.config.reminder_tone_volume,
+                    ) {
+                        Ok(tone) => self.reminder_tone = Some(tone),
+                        Err(e) => tracing::error!("Failed to restore desktop reminder tone: {}", e),
+                    }
+                }
+            } else if let Some(ref tone) = self.reminder_tone {
+                tone.set_frequency(self.config.reminder_tone_freq);
+                tone.set_volume(self.config.reminder_tone_volume);
+            }
+        }
+    }
+
     /// Sends a rebuild command to the tray thread with the current state.
     fn send_tray_rebuild(&self) {
+        let effective_input = self.config.effective_input_device();
+        let selected_input = if effective_input.is_empty() {
+            audio::devices::default_input_display_name().unwrap_or_default()
+        } else {
+            effective_input.to_string()
+        };
+        let effective_output = self.config.effective_output_device();
+        let selected_output = if effective_output.is_empty() {
+            audio::devices::default_output_display_name().unwrap_or_default()
+        } else {
+            effective_output.to_string()
+        };
+
         let _ = self.tray_command_tx.send(TrayCommand::Rebuild {
-            gender: self.config.target_gender,
+            gender: self.config.effective_target_gender(),
             input_devices: self.input_devices.clone(),
             output_devices: self.output_devices.clone(),
-            selected_input: self.config.input_device_name.clone(),
-            selected_output: self.config.output_device_name.clone(),
+            selected_input,
+            selected_output,
             vr_overlay_enabled: self.config.vr_overlay_enabled,
+            vr_specific_settings: self.config.vr_specific_settings,
+            vr_mode_active: self.vr_mode_active,
         });
     }
 

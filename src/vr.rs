@@ -15,7 +15,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
-// OpenVR C‑API type definitions (minimal subset)
+// OpenVR C-API type definitions (minimal subset)
 // ---------------------------------------------------------------------------
 
 type VROverlayHandle = u64;
@@ -28,21 +28,21 @@ struct HmdMatrix34 {
 }
 
 // Calling convention notes:
-// - Function‑table entries use `extern "system"` (stdcall on Win32, C on x64).
-// - DLL‑exported free functions use `extern "C"` (cdecl).
+// - Function-table entries use `extern "system"` (stdcall on Win32, C on x64).
+// - DLL-exported free functions use `extern "C"` (cdecl).
 type VrInitInternal2Fn =
     unsafe extern "C" fn(error: *mut i32, app_type: i32, startup_info: *const u8) -> u32;
 type VrShutdownInternalFn = unsafe extern "C" fn();
 type VrGetGenericInterfaceFn =
     unsafe extern "C" fn(iface_version: *const u8, error: *mut i32) -> *mut c_void;
 
-// -- IVRApplications function‑table entry types --
+// -- IVRApplications function-table entry types --
 type AddApplicationManifestFn =
     unsafe extern "system" fn(path: *const u8, temporary: bool) -> i32;
 type SetApplicationAutoLaunchFn =
     unsafe extern "system" fn(app_key: *const u8, auto_launch: bool) -> i32;
 
-// -- IVROverlay function‑table entry types --
+// -- IVROverlay function-table entry types --
 type CreateOverlayFn = unsafe extern "system" fn(
     key: *const u8,
     name: *const u8,
@@ -96,6 +96,67 @@ const K_TRACKED_DEVICE_HMD: TrackedDeviceIndex = 0;
 
 /// How often to retry VR initialisation when SteamVR isn't running yet.
 const VR_RETRY_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Optional VR overlay position/size configuration passed from config.
+#[allow(dead_code)]
+struct VrOverlayConfig {
+    vr_x: Option<i32>,
+    vr_y: Option<i32>,
+    vr_width: Option<f32>,
+    vr_height: Option<f32>,
+}
+
+// ---------------------------------------------------------------------------
+// SteamVR process detection
+// ---------------------------------------------------------------------------
+
+/// Returns true if `vrserver.exe` is currently running.
+///
+/// Prevents `VR_InitInternal2` from launching SteamVR when it isn't already
+/// running. Uses Win32 process snapshot APIs.
+fn is_steamvr_running() -> bool {
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    let snapshot = match snapshot {
+        Ok(h) => h,
+        Err(_) => return false,
+    };
+
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+
+    let ok = unsafe { Process32FirstW(snapshot, &mut entry) };
+    if ok.is_err() {
+        let _ = unsafe { windows::Win32::Foundation::CloseHandle(snapshot) };
+        return false;
+    }
+
+    loop {
+        let name = String::from_utf16_lossy(
+            &entry.szExeFile[..entry
+                .szExeFile
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(entry.szExeFile.len())],
+        );
+        if name.eq_ignore_ascii_case("vrserver.exe") {
+            let _ = unsafe { windows::Win32::Foundation::CloseHandle(snapshot) };
+            return true;
+        }
+        if unsafe { Process32NextW(snapshot, &mut entry) }.is_err() {
+            break;
+        }
+    }
+
+    let _ = unsafe { windows::Win32::Foundation::CloseHandle(snapshot) };
+    false
+}
 
 // ---------------------------------------------------------------------------
 // DLL discovery
@@ -227,7 +288,12 @@ fn generate_vrmanifest() -> Option<PathBuf> {
 /// every 10 seconds until SteamVR becomes available (or `Quit` is received).
 /// Returns `None` only if `openvr_api.dll` cannot be found at all (SteamVR
 /// not installed).
-pub fn spawn_vr_overlay_thread() -> Option<mpsc::Sender<VrOverlayCommand>> {
+pub fn spawn_vr_overlay_thread(
+    vr_x: Option<i32>,
+    vr_y: Option<i32>,
+    vr_width: Option<f32>,
+    vr_height: Option<f32>,
+) -> Option<mpsc::Sender<VrOverlayCommand>> {
     tracing::debug!("VR: looking for openvr_api.dll");
 
     // Locate the DLL — this is the only hard failure (SteamVR not installed).
@@ -250,15 +316,26 @@ pub fn spawn_vr_overlay_thread() -> Option<mpsc::Sender<VrOverlayCommand>> {
 
     let (tx, rx) = mpsc::channel::<VrOverlayCommand>();
 
+    let overlay_config = VrOverlayConfig {
+        vr_x,
+        vr_y,
+        vr_width,
+        vr_height,
+    };
+
     std::thread::spawn(move || {
-        vr_thread_main(dll_path, rx);
+        vr_thread_main(dll_path, rx, overlay_config);
     });
 
     Some(tx)
 }
 
 /// Main loop for the VR thread. Retries VR init until SteamVR is available.
-fn vr_thread_main(dll_path: PathBuf, rx: mpsc::Receiver<VrOverlayCommand>) {
+fn vr_thread_main(
+    dll_path: PathBuf,
+    rx: mpsc::Receiver<VrOverlayCommand>,
+    overlay_config: VrOverlayConfig,
+) {
     // Load the DLL (persists for the lifetime of this thread).
     let lib = match unsafe { libloading::Library::new(&dll_path) } {
         Ok(lib) => lib,
@@ -299,7 +376,7 @@ fn vr_thread_main(dll_path: PathBuf, rx: mpsc::Receiver<VrOverlayCommand>) {
     };
     tracing::debug!("VR: DLL exports resolved");
 
-    // Retry loop: try to connect to SteamVR, sleeping between attempts.
+    // Retry loop: wait for SteamVR to be running, then connect.
     loop {
         // Check for Quit before each attempt.
         match rx.try_recv() {
@@ -308,6 +385,25 @@ fn vr_thread_main(dll_path: PathBuf, rx: mpsc::Receiver<VrOverlayCommand>) {
                 return;
             }
             _ => {}
+        }
+
+        // Only attempt VR init if SteamVR is already running.
+        // Calling VR_InitInternal2 when SteamVR isn't running can launch it.
+        if !is_steamvr_running() {
+            tracing::debug!(
+                "VR: SteamVR not running, waiting {}s",
+                VR_RETRY_INTERVAL.as_secs()
+            );
+            for _ in 0..(VR_RETRY_INTERVAL.as_millis() / 200) {
+                match rx.recv_timeout(Duration::from_millis(200)) {
+                    Ok(VrOverlayCommand::Quit) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        tracing::debug!("VR: quit received while waiting for SteamVR");
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            continue;
         }
 
         tracing::debug!("VR: attempting VR_InitInternal2 (overlay mode)");
@@ -380,7 +476,7 @@ fn vr_thread_main(dll_path: PathBuf, rx: mpsc::Receiver<VrOverlayCommand>) {
         register_startup_app(vr_get_iface, &mut error);
 
         // Create and run the overlay, blocking until Quit or disconnect.
-        run_overlay(&overlay_fns, &rx);
+        run_overlay(&overlay_fns, &rx, &overlay_config);
 
         // Cleanup.
         unsafe { vr_shutdown() };
@@ -439,7 +535,11 @@ fn register_startup_app(
 }
 
 /// Creates the overlay, processes color commands, and returns on Quit/disconnect.
-fn run_overlay(fns: &OverlayFns, rx: &mpsc::Receiver<VrOverlayCommand>) {
+fn run_overlay(
+    fns: &OverlayFns,
+    rx: &mpsc::Receiver<VrOverlayCommand>,
+    overlay_config: &VrOverlayConfig,
+) {
     let key = CString::new("pitchbrick.indicator").unwrap();
     let name = CString::new("PitchBrick").unwrap();
     let mut handle: VROverlayHandle = 0;
@@ -453,20 +553,33 @@ fn run_overlay(fns: &OverlayFns, rx: &mpsc::Receiver<VrOverlayCommand>) {
     }
     tracing::debug!("VR: CreateOverlay succeeded (handle={})", handle);
 
-    // Size (3x the original 0.015m).
-    let width = 0.045_f32;
+    // Size: use config width if provided, else default 0.045m.
+    let width = overlay_config
+        .vr_width
+        .map(|w| w / 1920.0)
+        .unwrap_or(0.045_f32);
     let err = unsafe { (fns.set_width)(handle, width) };
     tracing::debug!("VR: SetOverlayWidthInMeters({}) = {}", width, err);
 
-    // Position: start at ~30deg right, ~20deg up, 1m in front of HMD,
-    // then shift 4 units (1 unit = 0.015m) toward center on a 45deg diagonal.
-    let angle_right = 30.0_f32.to_radians();
-    let angle_up = 20.0_f32.to_radians();
-    let distance = 1.0_f32;
-    let shift = 4.0 * 0.015 / 2.0_f32.sqrt();
-    let x = distance * angle_right.sin() - shift;
-    let y = distance * angle_up.sin() - shift;
-    let z = -distance * angle_right.cos() * angle_up.cos();
+    // Position: use config values if provided, else default position.
+    let (x, y, z) = if let (Some(vr_x), Some(vr_y)) = (overlay_config.vr_x, overlay_config.vr_y) {
+        let x = vr_x as f32 / 1920.0;
+        let y = -(vr_y as f32 / 1080.0); // negate: screen Y is down, VR Y is up
+        let z = -1.0_f32;
+        (x, y, z)
+    } else {
+        // Default: ~30deg right, ~20deg up, 1m in front of HMD,
+        // shifted 4 units toward center on a 45deg diagonal.
+        let angle_right = 30.0_f32.to_radians();
+        let angle_up = 20.0_f32.to_radians();
+        let distance = 1.0_f32;
+        let shift = 4.0 * 0.015 / 2.0_f32.sqrt();
+        let x = distance * angle_right.sin() - shift;
+        let y = distance * angle_up.sin() - shift;
+        let z = -distance * angle_right.cos() * angle_up.cos();
+        (x, y, z)
+    };
+
     let transform = HmdMatrix34 {
         m: [
             [1.0, 0.0, 0.0, x],
@@ -482,18 +595,32 @@ fn run_overlay(fns: &OverlayFns, rx: &mpsc::Receiver<VrOverlayCommand>) {
         x, y, z, err
     );
 
-    // Initial gray texture.
-    set_overlay_color(fns, handle, [0x60, 0x60, 0x60, 0xFF]);
+    // Initial green texture (overlay stays green unless explicitly Red).
+    set_overlay_color(fns, handle, [0x4C, 0xAF, 0x50, 0xFF]);
 
     let err = unsafe { (fns.show)(handle) };
     tracing::debug!("VR: ShowOverlay = {}", err);
     tracing::info!("VR: overlay visible");
 
-    // Command loop.
+    // Command loop with drain for smooth color fading.
     loop {
-        match rx.recv_timeout(Duration::from_millis(100)) {
+        match rx.recv_timeout(Duration::from_millis(16)) {
             Ok(VrOverlayCommand::SetColor(rgba)) => {
-                set_overlay_color(fns, handle, rgba);
+                let mut latest_color = rgba;
+                // Drain: keep reading until empty, apply only the latest color.
+                while let Ok(next) = rx.try_recv() {
+                    match next {
+                        VrOverlayCommand::SetColor(c) => latest_color = c,
+                        VrOverlayCommand::Quit => {
+                            tracing::info!("VR: shutting down overlay");
+                            set_overlay_color(fns, handle, latest_color);
+                            unsafe { (fns.destroy)(handle) };
+                            tracing::debug!("VR: overlay destroyed");
+                            return;
+                        }
+                    }
+                }
+                set_overlay_color(fns, handle, latest_color);
             }
             Ok(VrOverlayCommand::Quit) => {
                 tracing::info!("VR: shutting down overlay");
