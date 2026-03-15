@@ -476,12 +476,25 @@ fn vr_thread_main(
         register_startup_app(vr_get_iface, &mut error);
 
         // Create and run the overlay, blocking until Quit or disconnect.
-        run_overlay(&overlay_fns, &rx, &overlay_config);
+        let should_retry = run_overlay(&overlay_fns, &rx, &overlay_config);
 
         // Cleanup.
         unsafe { vr_shutdown() };
         tracing::debug!("VR: VR_Shutdown called");
-        return;
+
+        if !should_retry {
+            return;
+        }
+        tracing::info!("VR: overlay lost, will reconnect after {}s", VR_RETRY_INTERVAL.as_secs());
+        for _ in 0..(VR_RETRY_INTERVAL.as_millis() / 200) {
+            match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(VrOverlayCommand::Quit) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    tracing::debug!("VR: quit received while waiting to reconnect");
+                    return;
+                }
+                _ => {}
+            }
+        }
     }
 }
 
@@ -535,11 +548,15 @@ fn register_startup_app(
 }
 
 /// Creates the overlay, processes color commands, and returns on Quit/disconnect.
+///
+/// Returns `true` if the overlay died due to a stale handle (caller should
+/// re-initialise VR and retry). Returns `false` on clean shutdown (Quit or
+/// channel disconnect).
 fn run_overlay(
     fns: &OverlayFns,
     rx: &mpsc::Receiver<VrOverlayCommand>,
     overlay_config: &VrOverlayConfig,
-) {
+) -> bool {
     let key = CString::new("pitchbrick.indicator").unwrap();
     let name = CString::new("PitchBrick").unwrap();
     let mut handle: VROverlayHandle = 0;
@@ -549,7 +566,7 @@ fn run_overlay(
     };
     if err != 0 {
         tracing::warn!("VR: CreateOverlay failed (error {})", err);
-        return;
+        return true; // stale session — retry
     }
     tracing::debug!("VR: CreateOverlay succeeded (handle={})", handle);
 
@@ -613,34 +630,44 @@ fn run_overlay(
                         VrOverlayCommand::SetColor(c) => latest_color = c,
                         VrOverlayCommand::Quit => {
                             tracing::info!("VR: shutting down overlay");
-                            set_overlay_color(fns, handle, latest_color);
+                            let _ = set_overlay_color(fns, handle, latest_color);
                             unsafe { (fns.destroy)(handle) };
                             tracing::debug!("VR: overlay destroyed");
-                            return;
+                            return false; // clean quit
                         }
                     }
                 }
-                set_overlay_color(fns, handle, latest_color);
+                let ovr_err = set_overlay_color(fns, handle, latest_color);
+                if ovr_err != 0 {
+                    tracing::warn!(
+                        "VR: SetOverlayRaw failed (error {}), overlay handle is stale — will reconnect",
+                        ovr_err
+                    );
+                    unsafe { (fns.destroy)(handle) };
+                    return true; // stale — retry
+                }
             }
             Ok(VrOverlayCommand::Quit) => {
                 tracing::info!("VR: shutting down overlay");
-                break;
+                unsafe { (fns.destroy)(handle) };
+                tracing::debug!("VR: overlay destroyed");
+                return false; // clean quit
             }
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                unsafe { (fns.destroy)(handle) };
+                tracing::debug!("VR: channel disconnected, overlay destroyed");
+                return false; // clean quit
+            }
         }
     }
-
-    unsafe { (fns.destroy)(handle) };
-    tracing::debug!("VR: overlay destroyed");
 }
 
-fn set_overlay_color(fns: &OverlayFns, handle: VROverlayHandle, rgba: [u8; 4]) {
+/// Returns the OpenVR error code (0 = success).
+fn set_overlay_color(fns: &OverlayFns, handle: VROverlayHandle, rgba: [u8; 4]) -> i32 {
     let mut pixels = [0u8; 4 * 4 * 4];
     for chunk in pixels.chunks_exact_mut(4) {
         chunk.copy_from_slice(&rgba);
     }
-    unsafe {
-        (fns.set_raw)(handle, pixels.as_mut_ptr().cast(), 4, 4, 4);
-    }
+    unsafe { (fns.set_raw)(handle, pixels.as_mut_ptr().cast(), 4, 4, 4) }
 }
