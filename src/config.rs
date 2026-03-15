@@ -3,6 +3,10 @@
 /// Handles loading, saving, validating, and hot-reloading the TOML
 /// configuration file stored in the user's home directory.
 use serde::{Deserialize, Serialize};
+
+fn default_true() -> bool {
+    true
+}
 use std::path::{Path, PathBuf};
 
 /// Minimum gap in Hz that must always separate male_freq_high and female_freq_low.
@@ -232,6 +236,10 @@ pub struct Config {
     /// should never be prompted again.
     #[serde(default)]
     pub start_menu_shortcut_declined: bool,
+    /// If true, PitchBrick registers itself in the Windows startup registry
+    /// so it launches automatically on login.
+    #[serde(default = "default_true")]
+    pub autostart: bool,
 }
 
 impl Default for Config {
@@ -257,6 +265,7 @@ impl Default for Config {
             update_last_checked_version: None,
             update_last_checked_date: None,
             start_menu_shortcut_declined: false,
+            autostart: true,
         }
     }
 }

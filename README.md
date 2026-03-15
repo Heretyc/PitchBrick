@@ -2,7 +2,18 @@
 
 ![PitchBrick](docs/logo.png)
 
-A real-time vocal pitch monitor for transgender voice training. PitchBrick displays a simple color indicator  green when your pitch is in your target range, red when it drifts out, and black when no voice is detected. An optional reminder tone plays after sustained out-of-range pitch to help build awareness.
+### [**PitchBrick**](https://crates.io/crates/pitchbrick) is a tiny always-on-top window that watches your voice pitch in real time and tells you **at a glance** whether you're hitting your target range.
+
+When you're practicing a feminine or masculine voice, it's easy to drift without noticing. **Especially in VR and games** You're already concentrating on resonance, breath, inflection, and everything else at once. PitchBrick takes pitch off your mental checklist. It sits in the corner of your screen  **over games, Discord calls, whatever** and shows you a single color: **green** when your pitch is in range, **red** when you've drifted out, **black** when it can't hear you.
+
+No graphs to read. No numbers to remember. Just a color you can glance at mid-conversation.
+
+It comes setup to use a classic feminine range (165-255 Hz), a masculine range (85-180 Hz), or dial in your own custom target. If you stay in the red zone for too long, an optional reminder tone plays so you catch yourself without having to watch the screen constantly. Everything is configurable and takes effect instantly.
+
+It won't teach you how to change your voice. But once you're working on pitch, it keeps you honest.
+
+## VRChat specific guidance
+### PitchBrick is a proper SteamVR Startup overlay too! It shows up on the corner of your vision automatically when starting SteamVR. So you can have a clean little reminder where you are. You can mute yourself in VR and do a quick vocal check without leaving VR. Plus get great feedback on how you are doing, **even when busy doing other things.**
 
 ## Features
 

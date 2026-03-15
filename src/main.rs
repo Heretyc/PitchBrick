@@ -5,6 +5,7 @@
 /// from screen metrics, loads configuration, and launches the Iced GUI.
 mod app;
 mod audio;
+mod autostart;
 mod config;
 mod shortcut;
 mod tray;

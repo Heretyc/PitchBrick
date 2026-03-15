@@ -46,6 +46,8 @@ pub enum Message {
     ToggleVrOverlay,
     /// User toggled VR-specific settings on/off from the tray menu.
     ToggleVrSpecificSettings,
+    /// User toggled "Start with Windows" autostart on/off from the tray menu.
+    ToggleAutostart,
     /// User clicked the "Written by Lexi" footer to open the Patreon page.
     OpenPatreon,
     /// User accepted the update — run cargo install and exit.
@@ -245,6 +247,8 @@ impl PitchBrick {
             UpdateMenuState::Ready
         };
 
+        crate::autostart::sync_autostart(config.autostart);
+
         let (tray_command_tx, tray_menu_ids) = tray::spawn_tray_thread(
             config.effective_target_gender(),
             input_devices.clone(),
@@ -253,6 +257,7 @@ impl PitchBrick {
             selected_output,
             config.vr_overlay_enabled,
             config.vr_specific_settings,
+            config.autostart,
             initial_update_state.clone(),
         );
 
@@ -751,6 +756,9 @@ impl PitchBrick {
                 } else if menu_id == ids.vr_specific_settings_toggle {
                     drop(ids);
                     return self.update(Message::ToggleVrSpecificSettings);
+                } else if menu_id == ids.autostart_toggle {
+                    drop(ids);
+                    return self.update(Message::ToggleAutostart);
                 } else if menu_id == ids.check_for_updates {
                     drop(ids);
                     // Dispatch based on current update menu state.
@@ -848,6 +856,17 @@ impl PitchBrick {
                     self.config.vr_specific_settings
                 );
                 self.handle_vr_mode_transition();
+                self.send_tray_rebuild();
+                Task::none()
+            }
+            Message::ToggleAutostart => {
+                self.config.autostart = !self.config.autostart;
+                crate::autostart::sync_autostart(self.config.autostart);
+                self.config.save(&Config::path());
+                self.config_last_modified = std::fs::metadata(Config::path())
+                    .ok()
+                    .and_then(|m| m.modified().ok());
+                tracing::info!("Autostart toggled to {}", self.config.autostart);
                 self.send_tray_rebuild();
                 Task::none()
             }
@@ -1115,6 +1134,7 @@ impl PitchBrick {
             vr_overlay_enabled: self.config.vr_overlay_enabled,
             vr_specific_settings: self.config.vr_specific_settings,
             vr_mode_active: self.vr_mode_active,
+            autostart_enabled: self.config.autostart,
         });
     }
 
