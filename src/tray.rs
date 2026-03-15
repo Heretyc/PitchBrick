@@ -33,6 +33,7 @@ pub enum TrayCommand {
         output_devices: Vec<String>,
         selected_input: String,
         selected_output: String,
+        vr_overlay_enabled: bool,
     },
     /// Update the tray icon color to reflect the current pitch state.
     SetState(TrayState),
@@ -45,6 +46,7 @@ pub enum TrayCommand {
 pub struct TrayMenuIds {
     pub gender_toggle: MenuId,
     pub open_config: MenuId,
+    pub vr_overlay_toggle: MenuId,
     pub patreon: MenuId,
     pub quit: MenuId,
     /// `(menu_id, device_name)` pairs for input devices.
@@ -63,9 +65,16 @@ fn build_tray_menu(
     output_devices: &[String],
     selected_input: &str,
     selected_output: &str,
+    vr_overlay_enabled: bool,
 ) -> (Menu, TrayMenuIds) {
     let gender_item = MenuItem::new(format!("Target: {}", gender), true, None);
     let open_config_item = MenuItem::new("Open Config", true, None);
+    let vr_label = if vr_overlay_enabled {
+        "✓ Toggle SteamVR Overlay"
+    } else {
+        "  Toggle SteamVR Overlay"
+    };
+    let vr_overlay_item = MenuItem::new(vr_label, true, None);
 
     let input_submenu = Submenu::new("Input Device", true);
     let mut input_ids = Vec::new();
@@ -101,6 +110,7 @@ fn build_tray_menu(
     let ids = TrayMenuIds {
         gender_toggle: gender_item.id().clone(),
         open_config: open_config_item.id().clone(),
+        vr_overlay_toggle: vr_overlay_item.id().clone(),
         patreon: patreon_item.id().clone(),
         quit: quit_item.id().clone(),
         input_devices: input_ids,
@@ -110,6 +120,7 @@ fn build_tray_menu(
     let menu = Menu::new();
     menu.append(&gender_item).ok();
     menu.append(&open_config_item).ok();
+    menu.append(&vr_overlay_item).ok();
     menu.append(&PredefinedMenuItem::separator()).ok();
     menu.append(&input_submenu).ok();
     menu.append(&output_submenu).ok();
@@ -148,12 +159,14 @@ pub fn spawn_tray_thread(
     output_devices: Vec<String>,
     selected_input: String,
     selected_output: String,
+    vr_overlay_enabled: bool,
 ) -> (std::sync::mpsc::Sender<TrayCommand>, Arc<Mutex<TrayMenuIds>>) {
     // ids_shared is populated by the thread once it builds the menu.
     // We pre-fill with a placeholder so the Arc exists before the thread starts.
     let placeholder_ids = TrayMenuIds {
         gender_toggle: MenuId::new("__placeholder__"),
         open_config: MenuId::new("__placeholder__"),
+        vr_overlay_toggle: MenuId::new("__placeholder__"),
         patreon: MenuId::new("__placeholder__"),
         quit: MenuId::new("__placeholder__"),
         input_devices: Vec::new(),
@@ -172,6 +185,7 @@ pub fn spawn_tray_thread(
             &output_devices,
             &selected_input,
             &selected_output,
+            vr_overlay_enabled,
         );
         let tooltip = format!("PitchBrick - Target: {}", gender);
 
@@ -219,6 +233,7 @@ pub fn spawn_tray_thread(
                             output_devices,
                             selected_input,
                             selected_output,
+                            vr_overlay_enabled,
                         } => {
                             let (new_menu, new_ids) = build_tray_menu(
                                 gender,
@@ -226,6 +241,7 @@ pub fn spawn_tray_thread(
                                 &output_devices,
                                 &selected_input,
                                 &selected_output,
+                                vr_overlay_enabled,
                             );
                             tray.set_menu(Some(Box::new(new_menu)));
                             let tooltip = format!("PitchBrick - Target: {}", gender);

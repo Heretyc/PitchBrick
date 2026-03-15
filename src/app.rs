@@ -40,6 +40,8 @@ pub enum Message {
     /// The verbose log window was opened; ID already pre-assigned but message
     /// completes the open task.
     LogWindowOpened(window::Id),
+    /// User toggled the VR overlay on/off from the tray menu.
+    ToggleVrOverlay,
     /// User clicked the "Written by Lexi" footer to open the Patreon page.
     OpenPatreon,
     /// Discards a task result with no side effect.
@@ -96,6 +98,9 @@ pub struct PitchBrick {
     pub log_window_id: Option<window::Id>,
     /// Channel receiver for incoming log lines (verbose mode only).
     pub log_rx: Option<std::sync::mpsc::Receiver<String>>,
+    /// Command sender for the VR overlay thread (None if VR unavailable or disabled).
+    #[cfg(feature = "vr-overlay")]
+    pub vr_overlay_tx: Option<std::sync::mpsc::Sender<crate::vr::VrOverlayCommand>>,
 }
 
 impl PitchBrick {
@@ -187,7 +192,15 @@ impl PitchBrick {
             output_devices.clone(),
             config.input_device_name.clone(),
             config.output_device_name.clone(),
+            config.vr_overlay_enabled,
         );
+
+        #[cfg(feature = "vr-overlay")]
+        let vr_overlay_tx = if config.vr_overlay_enabled {
+            crate::vr::spawn_vr_overlay_thread()
+        } else {
+            None
+        };
 
         // Open the main borderless always-on-top window.
         let (main_id, open_main) = window::open(window::Settings {
@@ -238,6 +251,8 @@ impl PitchBrick {
             log_lines: Vec::new(),
             log_window_id,
             log_rx,
+            #[cfg(feature = "vr-overlay")]
+            vr_overlay_tx,
         };
 
         let init_task = Task::batch([open_main.map(|_| Message::Noop), open_log_task]);
@@ -307,6 +322,16 @@ impl PitchBrick {
                             DisplayState::Black => TrayState::Inactive,
                         };
                         let _ = self.tray_command_tx.send(TrayCommand::SetState(tray_state));
+
+                        #[cfg(feature = "vr-overlay")]
+                        if let Some(ref tx) = self.vr_overlay_tx {
+                            let rgba = match new_state {
+                                DisplayState::Green => [0x4C, 0xAF, 0x50, 0xFF],
+                                DisplayState::Red => [0xF4, 0x43, 0x36, 0xFF],
+                                DisplayState::Black => [0x60, 0x60, 0x60, 0xFF],
+                            };
+                            let _ = tx.send(crate::vr::VrOverlayCommand::SetColor(rgba));
+                        }
                     }
                 }
 
@@ -517,6 +542,9 @@ impl PitchBrick {
                 } else if menu_id == ids.open_config {
                     drop(ids);
                     return self.update(Message::OpenSettings);
+                } else if menu_id == ids.vr_overlay_toggle {
+                    drop(ids);
+                    return self.update(Message::ToggleVrOverlay);
                 } else if menu_id == ids.patreon {
                     drop(ids);
                     return self.update(Message::OpenPatreon);
@@ -538,7 +566,43 @@ impl PitchBrick {
                 }
                 Task::none()
             }
+            Message::ToggleVrOverlay => {
+                self.config.vr_overlay_enabled = !self.config.vr_overlay_enabled;
+                self.config.save(&Config::path());
+                self.config_last_modified = std::fs::metadata(Config::path())
+                    .ok()
+                    .and_then(|m| m.modified().ok());
+                tracing::info!("VR overlay toggled to {}", self.config.vr_overlay_enabled);
+
+                #[cfg(feature = "vr-overlay")]
+                {
+                    if self.config.vr_overlay_enabled {
+                        // Spawn VR thread and send current color.
+                        self.vr_overlay_tx = crate::vr::spawn_vr_overlay_thread();
+                        if let Some(ref tx) = self.vr_overlay_tx {
+                            let rgba = match self.display_state {
+                                DisplayState::Green => [0x4C, 0xAF, 0x50, 0xFF],
+                                DisplayState::Red => [0xF4, 0x43, 0x36, 0xFF],
+                                DisplayState::Black => [0x60, 0x60, 0x60, 0xFF],
+                            };
+                            let _ = tx.send(crate::vr::VrOverlayCommand::SetColor(rgba));
+                        }
+                    } else {
+                        // Shut down VR thread.
+                        if let Some(tx) = self.vr_overlay_tx.take() {
+                            let _ = tx.send(crate::vr::VrOverlayCommand::Quit);
+                        }
+                    }
+                }
+
+                self.send_tray_rebuild();
+                Task::none()
+            }
             Message::QuitRequested => {
+                #[cfg(feature = "vr-overlay")]
+                if let Some(ref tx) = self.vr_overlay_tx {
+                    let _ = tx.send(crate::vr::VrOverlayCommand::Quit);
+                }
                 let _ = self.tray_command_tx.send(TrayCommand::Quit);
                 iced::exit()
             }
@@ -566,6 +630,7 @@ impl PitchBrick {
             output_devices: self.output_devices.clone(),
             selected_input: self.config.input_device_name.clone(),
             selected_output: self.config.output_device_name.clone(),
+            vr_overlay_enabled: self.config.vr_overlay_enabled,
         });
     }
 

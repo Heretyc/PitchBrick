@@ -8,6 +8,8 @@ mod audio;
 mod config;
 mod tray;
 mod ui;
+#[cfg(feature = "vr-overlay")]
+mod vr;
 
 use clap::Parser;
 use iced::window;

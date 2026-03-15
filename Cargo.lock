@@ -3016,6 +3016,7 @@ dependencies = [
  "cpal",
  "dirs",
  "iced",
+ "libloading 0.8.9",
  "realfft",
  "rustfft",
  "serde",

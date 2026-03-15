@@ -91,6 +91,8 @@ pub struct Config {
     pub input_device_name: String,
     /// Name of the selected audio output device, or empty for system default.
     pub output_device_name: String,
+    /// Whether the SteamVR overlay is enabled (requires vr-overlay feature at compile time).
+    pub vr_overlay_enabled: bool,
 }
 
 impl Default for Config {
@@ -110,6 +112,7 @@ impl Default for Config {
             window_height: None,
             input_device_name: String::new(),
             output_device_name: String::new(),
+            vr_overlay_enabled: true,
         }
     }
 }

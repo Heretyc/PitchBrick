@@ -18,6 +18,10 @@ include = [
     "Cargo.lock",
 ]
 
+[features]
+default = ["vr-overlay"]
+vr-overlay = ["dep:libloading"]
+
 [dependencies]
 iced = { version = "0.14", features = ["canvas", "tokio"] }
 cpal = "0.17"
@@ -29,9 +33,10 @@ dirs = "6"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+libloading = { version = "0.8", optional = true }
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.58", features = ["Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.58", features = ["Win32_UI_WindowsAndMessaging", "Win32_System_Registry"] }
 tray-icon = "0.21"
 
 [target.'cfg(windows)'.build-dependencies]
