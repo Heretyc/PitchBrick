@@ -3,14 +3,16 @@
 /// Contains the main application struct, message enum, and the update/view/subscription
 /// functions that drive the GUI event loop.
 use crate::audio;
-use crate::config::{Config, Gender};
+use crate::config::{self, Config, Gender};
 use crate::tray::{self, TrayCommand, TrayMenuIds, TrayState, UpdateMenuState};
 use crate::ui::display::{lerp_color, DisplayCanvas, DisplayState};
+use crate::ui::settings_window::{FreqHandle, SettingsState};
 use crate::update::{self, UpdateCheckResult};
 use iced::widget::canvas::Canvas;
 use iced::window;
 use iced::{Color, Element, Length, Size, Subscription, Task, Theme};
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use tray_icon::menu::MenuId;
@@ -33,8 +35,9 @@ pub enum Message {
     WindowMoved(window::Id, iced::Point),
     /// The window was resized (includes window ID for drag support).
     WindowResized(window::Id, iced::Size),
-    /// User clicked the canvas to drag the window.
-    DragWindow,
+    /// User clicked a window to drag it (carries the window ID so the handler
+    /// can verify it's the main window and not an auxiliary one).
+    DragWindow(window::Id),
     /// A tray menu item was clicked.
     TrayMenuEvent(MenuId),
     /// Application quit requested from the tray menu.
@@ -66,6 +69,69 @@ pub enum Message {
     DeclineShortcutUpdate,
     /// The shortcut mismatch dialog window was opened.
     ShortcutWindowOpened(window::Id),
+    /// The settings window was opened.
+    SettingsWindowOpened(window::Id),
+    /// A window's close button was clicked.
+    WindowCloseRequested(window::Id),
+
+    // ── Settings: top row ──
+    /// Check for updates button in settings.
+    SettingsCheckForUpdates,
+    /// Toggle autostart checkbox in settings.
+    SettingsToggleAutostart,
+
+    // ── Settings: desktop column ──
+    /// Toggle target gender in desktop settings.
+    SettingsToggleGender,
+    /// A frequency handle was dragged (desktop).
+    SettingsFreqChanged { handle: FreqHandle, value: f32 },
+    /// Reminder frequency slider changed (desktop).
+    SettingsReminderFreqChanged(f32),
+    /// Reminder frequency slider released (desktop).
+    SettingsReminderFreqReleased,
+    /// Red duration slider changed (desktop).
+    SettingsRedDurationChanged(f32),
+    /// Reminder volume slider changed (desktop).
+    SettingsReminderVolumeChanged(f32),
+    /// Reminder volume slider released (desktop).
+    SettingsReminderVolumeReleased,
+    /// Mic sensitivity slider changed (desktop).
+    SettingsMicSensitivityChanged(f32),
+    /// Input device selected in desktop settings.
+    SettingsSelectInputDevice(String),
+    /// Output device selected in desktop settings.
+    SettingsSelectOutputDevice(String),
+
+    // ── Settings: VR column ──
+    /// Toggle VR-specific settings enabled.
+    SettingsToggleVrEnabled,
+    /// Toggle target gender in VR settings.
+    SettingsVrToggleGender,
+    /// A frequency handle was dragged (VR).
+    SettingsVrFreqChanged { handle: FreqHandle, value: f32 },
+    /// VR reminder frequency slider changed.
+    SettingsVrReminderFreqChanged(f32),
+    /// VR reminder frequency slider released.
+    SettingsVrReminderFreqReleased,
+    /// VR red duration slider changed.
+    SettingsVrRedDurationChanged(f32),
+    /// VR reminder volume slider changed.
+    SettingsVrReminderVolumeChanged(f32),
+    /// VR reminder volume slider released.
+    SettingsVrReminderVolumeReleased,
+    /// VR mic sensitivity slider changed.
+    SettingsVrMicSensitivityChanged(f32),
+    /// VR input device selected.
+    SettingsVrSelectInputDevice(String),
+    /// VR output device selected.
+    SettingsVrSelectOutputDevice(String),
+    /// VR FOV overlay was dragged to a new position.
+    SettingsVrFovDragged { x: i32, y: i32 },
+
+    /// User selected a vocal rest threshold from the tray submenu.
+    /// 0 means OFF, otherwise minutes per hour.
+    SetVocalRestMinutes(u32),
+
     /// Discards a task result with no side effect.
     Noop,
 }
@@ -144,6 +210,21 @@ pub struct PitchBrick {
     pub shortcut_window_id: Option<window::Id>,
     /// Old target path when a shortcut mismatch was detected.
     pub shortcut_mismatch_old_path: Option<String>,
+    /// Window ID of the settings window (None when not open).
+    pub settings_window_id: Option<window::Id>,
+    /// Transient UI state for the settings window (None when not open).
+    pub settings_state: Option<SettingsState>,
+    /// Dynamic minimum noise floor shared with the analysis worker thread.
+    pub min_noise_floor: Arc<AtomicU32>,
+    /// Vocal rest rolling window tracker.
+    pub vocal_rest: crate::vocal_rest::VocalRestTracker,
+    /// Rodio output stream handle for playing the vocal rest WAV.
+    /// The `_stream` must be kept alive for the handle to remain valid.
+    pub rest_sound_stream: Option<(rodio::OutputStream, rodio::OutputStreamHandle)>,
+    /// Last time we rebuilt the tray menu for vocal rest display updates.
+    pub last_vocal_rest_tray_update: Instant,
+    /// Whether the raw (pre-overage) display state was Green on the previous tick.
+    pub was_raw_green: bool,
 }
 
 impl PitchBrick {
@@ -206,6 +287,14 @@ impl PitchBrick {
             }
         };
 
+        let rest_sound_stream = match rodio::OutputStream::try_default() {
+            Ok((stream, handle)) => Some((stream, handle)),
+            Err(e) => {
+                tracing::error!("Failed to create rodio output stream: {}", e);
+                None
+            }
+        };
+
         let input_devices = audio::devices::enumerate_input_devices();
         let output_devices = audio::devices::enumerate_output_devices();
 
@@ -219,8 +308,14 @@ impl PitchBrick {
 
         let now = Instant::now();
         let initial_color = DisplayState::Black.color();
-        let analysis_worker =
-            audio::analysis::AnalysisWorker::spawn(audio_buffer.clone(), sample_rate);
+        let initial_noise_floor =
+            config::mic_sensitivity_to_noise_floor(config.effective_mic_sensitivity());
+        let min_noise_floor = Arc::new(AtomicU32::new(initial_noise_floor.to_bits()));
+        let analysis_worker = audio::analysis::AnalysisWorker::spawn(
+            audio_buffer.clone(),
+            sample_rate,
+            min_noise_floor.clone(),
+        );
 
         let config_last_modified = std::fs::metadata(Config::path())
             .ok()
@@ -241,13 +336,12 @@ impl PitchBrick {
 
         // Determine initial update check state and spawn background check if due.
         let should_check = config_is_new || config.is_update_check_due();
-        let initial_update_state = if should_check {
-            UpdateMenuState::Checking
-        } else {
-            UpdateMenuState::Ready
-        };
 
         crate::autostart::sync_autostart(config.autostart);
+
+        let vocal_rest = crate::vocal_rest::VocalRestTracker::load(
+            &crate::vocal_rest::VocalRestTracker::path(),
+        );
 
         let (tray_command_tx, tray_menu_ids) = tray::spawn_tray_thread(
             config.effective_target_gender(),
@@ -257,8 +351,8 @@ impl PitchBrick {
             selected_output,
             config.vr_overlay_enabled,
             config.vr_specific_settings,
-            config.autostart,
-            initial_update_state.clone(),
+            config.vocal_rest_minutes,
+            vocal_rest.accumulated_ms(now) / 1000,
         );
 
         let update_check_rx = if should_check {
@@ -348,6 +442,13 @@ impl PitchBrick {
             no_updates_timer: None,
             shortcut_window_id: None,
             shortcut_mismatch_old_path: None,
+            settings_window_id: None,
+            settings_state: None,
+            min_noise_floor,
+            vocal_rest,
+            rest_sound_stream,
+            last_vocal_rest_tray_update: now,
+            was_raw_green: false,
         };
 
         // Check Start Menu shortcut and open dialog if mismatched.
@@ -403,7 +504,8 @@ impl PitchBrick {
                     self.detected_freq = last;
                     tracing::debug!("result: {:?}", last);
 
-                    let new_state = match last {
+                    // Classify raw display state (before vocal rest override).
+                    let raw_state = match last {
                         Some(freq) if (85.0..=350.0).contains(&freq) => {
                             let (low, high) = self.config.effective_target_range();
                             if freq >= low && freq <= high {
@@ -430,6 +532,46 @@ impl PitchBrick {
                         None => DisplayState::Black,
                     };
 
+                    // --- Vocal rest: track green enter/exit ---
+                    let is_raw_green = raw_state == DisplayState::Green;
+                    if is_raw_green && !self.was_raw_green {
+                        self.vocal_rest.on_green_enter(now);
+                    } else if !is_raw_green && self.was_raw_green {
+                        self.vocal_rest.on_green_exit(now);
+                    }
+                    self.was_raw_green = is_raw_green;
+
+                    // Prune spans older than 1 hour and update overage state.
+                    self.vocal_rest.prune_old_spans();
+                    let just_entered_overage = self
+                        .vocal_rest
+                        .update_overage(now, self.config.vocal_rest_minutes);
+
+                    // Play rest sound on overage entry and every 60s while in green.
+                    if just_entered_overage {
+                        tracing::info!("Vocal rest: entered overage mode");
+                    }
+                    if self.vocal_rest.in_overage
+                        && is_raw_green
+                        && self.vocal_rest.should_play_rest_sound(now)
+                    {
+                        if let Some((_, ref handle)) = self.rest_sound_stream {
+                            let cursor = std::io::Cursor::new(crate::vocal_rest::REST_WAV);
+                            if let Err(e) = handle.play_once(cursor) {
+                                tracing::error!("Failed to play rest sound: {}", e);
+                            }
+                        }
+                    }
+
+                    // Override Green → Yellow when in overage.
+                    let new_state = if raw_state == DisplayState::Green
+                        && self.vocal_rest.in_overage
+                    {
+                        DisplayState::Yellow
+                    } else {
+                        raw_state
+                    };
+
                     if new_state != self.display_state {
                         tracing::debug!(
                             "State {:?} -> {:?} (freq: {:?})",
@@ -443,6 +585,7 @@ impl PitchBrick {
                         self.color_transition_start = now;
                         let tray_state = match new_state {
                             DisplayState::Green => TrayState::Green,
+                            DisplayState::Yellow => TrayState::Yellow,
                             DisplayState::Red => TrayState::Red,
                             DisplayState::Black => TrayState::Inactive,
                         };
@@ -450,11 +593,15 @@ impl PitchBrick {
 
                         #[cfg(feature = "vr-overlay")]
                         if let Some(ref tx) = self.vr_overlay_tx {
+                            // VR overlay resting color is green normally,
+                            // yellow during vocal rest overage.
                             let rgba = match new_state {
-                                DisplayState::Green | DisplayState::Black => {
-                                    [0x4C, 0xAF, 0x50, 0xFF]
-                                }
                                 DisplayState::Red => [0xF4, 0x43, 0x36, 0xFF],
+                                DisplayState::Yellow => [0xFF, 0xEB, 0x3B, 0xFF],
+                                _ if self.vocal_rest.in_overage => {
+                                    [0xFF, 0xEB, 0x3B, 0xFF]
+                                }
+                                _ => [0x4C, 0xAF, 0x50, 0xFF],
                             };
                             let _ = tx.send(crate::vr::VrOverlayCommand::SetColor(rgba));
                         }
@@ -470,7 +617,15 @@ impl PitchBrick {
                         if let Some(red_start) = self.red_since {
                             let elapsed = now.duration_since(red_start).as_secs_f32();
                             if elapsed >= self.config.effective_red_duration() {
-                                if let Some(ref tone) = self.reminder_tone {
+                                if self.vocal_rest.in_overage {
+                                    // Suppress red tone; show rest tooltip instead.
+                                    if self.vocal_rest.should_show_red_tooltip(now) {
+                                        let _ = self.tray_command_tx.send(TrayCommand::ShowBalloon {
+                                            title: "PitchBrick".to_string(),
+                                            message: "You have trained enough for this hour, time to give your voice a rest.\n\nYou can disable this setting in the menu.".to_string(),
+                                        });
+                                    }
+                                } else if let Some(ref tone) = self.reminder_tone {
                                     if !tone.is_playing() {
                                         tone.start();
                                         tracing::info!("Reminder tone started");
@@ -499,6 +654,26 @@ impl PitchBrick {
                     / 0.15)
                     .min(1.0);
                 self.current_color = lerp_color(self.from_color, self.target_color, t);
+
+                // --- Vocal rest: periodic tooltip update (every 5s) and disk flush (every 2min) ---
+                // We update the tooltip rather than rebuilding the menu, because
+                // `tray.set_menu()` closes any open context menu on Windows,
+                // which would make the vocal rest submenu impossible to use.
+                if self.config.vocal_rest_minutes > 0
+                    && now.duration_since(self.last_vocal_rest_tray_update)
+                        >= Duration::from_secs(5)
+                {
+                    self.last_vocal_rest_tray_update = now;
+                    let _ =
+                        self.tray_command_tx.send(TrayCommand::UpdateTooltip {
+                            vocal_rest_trained_secs: self.vocal_rest.accumulated_ms(
+                                Instant::now(),
+                            )
+                                / 1000,
+                        });
+                }
+                self.vocal_rest
+                    .flush_if_due(&crate::vocal_rest::VocalRestTracker::path(), now);
 
                 // --- Debounced config save (500ms after last window/settings change) ---
                 if let Some(save_time) = self.save_timer {
@@ -639,10 +814,27 @@ impl PitchBrick {
                     Task::none()
                 };
 
+                // --- Settings window: 5-second debounced save ---
+                if let Some(ref mut state) = self.settings_state {
+                    if state.dirty {
+                        if let Some(last) = state.last_change {
+                            if now.duration_since(last) >= Duration::from_secs(5) {
+                                state.dirty = false;
+                                state.last_change = None;
+                                self.config.save(&Config::path());
+                                self.config_last_modified = std::fs::metadata(Config::path())
+                                    .ok()
+                                    .and_then(|m| m.modified().ok());
+                            }
+                        }
+                    }
+                }
+
                 Task::batch([update_task, log_task])
             }
-            Message::DragWindow => {
-                if let Some(id) = self.window_id {
+            Message::DragWindow(id) => {
+                // Only drag the main window, not settings/log/dialog windows.
+                if Some(id) == self.window_id {
                     window::drag(id)
                 } else {
                     Task::none()
@@ -660,12 +852,20 @@ impl PitchBrick {
                 Task::none()
             }
             Message::OpenSettings => {
-                let path = Config::path();
-                tracing::info!("Opening config file: {:?}", path);
-                if let Err(e) = std::process::Command::new("notepad.exe").arg(&path).spawn() {
-                    tracing::error!("Failed to open config in notepad: {}", e);
+                if let Some(id) = self.settings_window_id {
+                    return window::gain_focus(id);
                 }
-                Task::none()
+                let (win_id, open_task) = window::open(window::Settings {
+                    size: Size::new(800.0, 500.0),
+                    position: window::Position::Centered,
+                    resizable: false,
+                    decorations: true,
+                    exit_on_close_request: false,
+                    ..Default::default()
+                });
+                self.settings_window_id = Some(win_id);
+                self.settings_state = Some(SettingsState::new());
+                open_task.map(Message::SettingsWindowOpened)
             }
             Message::SelectInputDevice(name) => {
                 self.config.input_device_name = name.clone();
@@ -679,6 +879,7 @@ impl PitchBrick {
                             self.analysis_worker = audio::analysis::AnalysisWorker::spawn(
                                 self.audio_buffer.clone(),
                                 self.sample_rate,
+                                self.min_noise_floor.clone(),
                             );
                             tracing::info!("Input device changed to: {}", name);
                         }
@@ -723,9 +924,7 @@ impl PitchBrick {
                 Task::none()
             }
             Message::WindowMoved(id, point) => {
-                // Only save position for the main window, not the log window.
-                if Some(id) != self.log_window_id {
-                    self.window_id = Some(id);
+                if Some(id) == self.window_id {
                     self.config.window_x = Some(point.x as i32);
                     self.config.window_y = Some(point.y as i32);
                     self.save_timer = Some(Instant::now());
@@ -733,9 +932,7 @@ impl PitchBrick {
                 Task::none()
             }
             Message::WindowResized(id, size) => {
-                // Only save size for the main window, not the log window.
-                if Some(id) != self.log_window_id {
-                    self.window_id = Some(id);
+                if Some(id) == self.window_id {
                     self.config.window_width = Some(size.width);
                     self.config.window_height = Some(size.height);
                     self.save_timer = Some(Instant::now());
@@ -756,32 +953,6 @@ impl PitchBrick {
                 } else if menu_id == ids.vr_specific_settings_toggle {
                     drop(ids);
                     return self.update(Message::ToggleVrSpecificSettings);
-                } else if menu_id == ids.autostart_toggle {
-                    drop(ids);
-                    return self.update(Message::ToggleAutostart);
-                } else if menu_id == ids.check_for_updates {
-                    drop(ids);
-                    // Dispatch based on current update menu state.
-                    return match &self.update_menu_state {
-                        UpdateMenuState::Available(v) => {
-                            // Re-open update window if not already open.
-                            if self.update_window_id.is_some() {
-                                Task::none()
-                            } else {
-                                self.update_available_version = Some(v.clone());
-                                let (win_id, open_task) = window::open(window::Settings {
-                                    size: Size::new(340.0, 160.0),
-                                    resizable: false,
-                                    decorations: true,
-                                    exit_on_close_request: true,
-                                    ..Default::default()
-                                });
-                                self.update_window_id = Some(win_id);
-                                open_task.map(Message::UpdateWindowOpened)
-                            }
-                        }
-                        _ => self.update(Message::CheckForUpdates),
-                    };
                 } else if menu_id == ids.patreon {
                     drop(ids);
                     return self.update(Message::OpenPatreon);
@@ -800,6 +971,12 @@ impl PitchBrick {
                     let name = name.clone();
                     drop(ids);
                     return self.update(Message::SelectOutputDevice(name));
+                } else if let Some((_, minutes)) =
+                    ids.vocal_rest_items.iter().find(|(id, _)| *id == menu_id)
+                {
+                    let minutes = *minutes;
+                    drop(ids);
+                    return self.update(Message::SetVocalRestMinutes(minutes));
                 }
                 Task::none()
             }
@@ -822,9 +999,12 @@ impl PitchBrick {
                             vr.and_then(|v| v.vr_height),
                         );
                         if let Some(ref tx) = self.vr_overlay_tx {
-                            // VR overlay stays green unless actively Red.
                             let rgba = match self.display_state {
                                 DisplayState::Red => [0xF4, 0x43, 0x36, 0xFF],
+                                DisplayState::Yellow => [0xFF, 0xEB, 0x3B, 0xFF],
+                                _ if self.vocal_rest.in_overage => {
+                                    [0xFF, 0xEB, 0x3B, 0xFF]
+                                }
                                 _ => [0x4C, 0xAF, 0x50, 0xFF],
                             };
                             let _ = tx.send(crate::vr::VrOverlayCommand::SetColor(rgba));
@@ -870,7 +1050,27 @@ impl PitchBrick {
                 self.send_tray_rebuild();
                 Task::none()
             }
+            Message::SetVocalRestMinutes(minutes) => {
+                self.config.vocal_rest_minutes = minutes;
+                let config_path = Config::path();
+                self.config.save(&config_path);
+                self.config_last_modified = std::fs::metadata(&config_path)
+                    .ok()
+                    .and_then(|m| m.modified().ok());
+                tracing::info!("Vocal rest minutes set to {}", minutes);
+                self.send_tray_rebuild();
+                Task::none()
+            }
             Message::QuitRequested => {
+                // Save any pending settings changes before quitting.
+                if let Some(ref state) = self.settings_state {
+                    if state.dirty {
+                        self.config.save(&Config::path());
+                    }
+                }
+                // Flush vocal rest data before exit.
+                self.vocal_rest
+                    .flush(&crate::vocal_rest::VocalRestTracker::path());
                 #[cfg(feature = "vr-overlay")]
                 if let Some(ref tx) = self.vr_overlay_tx {
                     let _ = tx.send(crate::vr::VrOverlayCommand::Quit);
@@ -993,7 +1193,266 @@ impl PitchBrick {
                     .spawn();
                 Task::none()
             }
+            Message::SettingsWindowOpened(id) => {
+                self.settings_window_id = Some(id);
+                Task::none()
+            }
+            Message::WindowCloseRequested(id) => {
+                // Settings window close
+                if Some(id) == self.settings_window_id {
+                    if let Some(ref state) = self.settings_state {
+                        if state.dirty {
+                            self.config.save(&Config::path());
+                            self.config_last_modified = std::fs::metadata(Config::path())
+                                .ok()
+                                .and_then(|m| m.modified().ok());
+                        }
+                    }
+                    self.settings_window_id = None;
+                    self.settings_state = None;
+                    return window::close(id);
+                }
+                // Log window close
+                if Some(id) == self.log_window_id {
+                    self.log_window_id = None;
+                    return window::close(id);
+                }
+                Task::none()
+            }
+            Message::SettingsCheckForUpdates => self.update(Message::CheckForUpdates),
+            Message::SettingsToggleAutostart => self.update(Message::ToggleAutostart),
+            Message::SettingsToggleGender => {
+                self.config.target_gender = self.config.target_gender.toggle();
+                self.config.fix_overlap();
+                self.mark_settings_dirty();
+                self.send_tray_rebuild();
+                Task::none()
+            }
+            Message::SettingsFreqChanged { handle, value } => {
+                match handle {
+                    FreqHandle::MaleLow => self.config.male_freq_low = value,
+                    FreqHandle::MaleHigh => self.config.male_freq_high = value,
+                    FreqHandle::FemaleLow => self.config.female_freq_low = value,
+                    FreqHandle::FemaleHigh => self.config.female_freq_high = value,
+                }
+                self.config.fix_overlap();
+                self.mark_settings_dirty();
+                Task::none()
+            }
+            Message::SettingsReminderFreqChanged(v) => {
+                let v = (v * 10.0).round() / 10.0;
+                self.config.reminder_tone_freq = v;
+                if let Some(ref tone) = self.reminder_tone {
+                    tone.set_frequency(v);
+                    if !tone.is_playing() {
+                        if let Some(ref mut s) = self.settings_state {
+                            s.tone_was_already_playing = false;
+                        }
+                        tone.start();
+                    }
+                }
+                self.mark_settings_dirty();
+                Task::none()
+            }
+            Message::SettingsReminderFreqReleased => {
+                if let Some(ref state) = self.settings_state {
+                    if !state.tone_was_already_playing {
+                        if let Some(ref tone) = self.reminder_tone {
+                            tone.stop();
+                        }
+                    }
+                }
+                Task::none()
+            }
+            Message::SettingsRedDurationChanged(v) => {
+                let v = (v * 10.0).round() / 10.0;
+                self.config.red_duration_seconds = v;
+                self.mark_settings_dirty();
+                Task::none()
+            }
+            Message::SettingsReminderVolumeChanged(v) => {
+                let v = (v * 100.0).round() / 100.0;
+                self.config.reminder_tone_volume = v;
+                if let Some(ref tone) = self.reminder_tone {
+                    tone.set_volume(v);
+                    if !tone.is_playing() {
+                        if let Some(ref mut s) = self.settings_state {
+                            s.tone_was_already_playing = false;
+                        }
+                        tone.start();
+                    }
+                }
+                self.mark_settings_dirty();
+                Task::none()
+            }
+            Message::SettingsReminderVolumeReleased => {
+                if let Some(ref state) = self.settings_state {
+                    if !state.tone_was_already_playing {
+                        if let Some(ref tone) = self.reminder_tone {
+                            tone.stop();
+                        }
+                    }
+                }
+                Task::none()
+            }
+            Message::SettingsMicSensitivityChanged(v) => {
+                let v = v.round();
+                self.config.mic_sensitivity = v;
+                let floor = config::mic_sensitivity_to_noise_floor(v);
+                self.min_noise_floor
+                    .store(floor.to_bits(), Ordering::Relaxed);
+                self.mark_settings_dirty();
+                Task::none()
+            }
+            Message::SettingsSelectInputDevice(name) => {
+                self.update(Message::SelectInputDevice(name))
+            }
+            Message::SettingsSelectOutputDevice(name) => {
+                self.update(Message::SelectOutputDevice(name))
+            }
+            Message::SettingsToggleVrEnabled => self.update(Message::ToggleVrSpecificSettings),
+            Message::SettingsVrToggleGender => {
+                if let Some(ref mut vr) = self.config.vr {
+                    vr.target_gender = vr.target_gender.toggle();
+                    vr.fix_overlap();
+                }
+                self.mark_settings_dirty();
+                self.send_tray_rebuild();
+                Task::none()
+            }
+            Message::SettingsVrFreqChanged { handle, value } => {
+                if let Some(ref mut vr) = self.config.vr {
+                    match handle {
+                        FreqHandle::MaleLow => vr.male_freq_low = value,
+                        FreqHandle::MaleHigh => vr.male_freq_high = value,
+                        FreqHandle::FemaleLow => vr.female_freq_low = value,
+                        FreqHandle::FemaleHigh => vr.female_freq_high = value,
+                    }
+                    vr.fix_overlap();
+                }
+                self.mark_settings_dirty();
+                Task::none()
+            }
+            Message::SettingsVrReminderFreqChanged(v) => {
+                let v = (v * 10.0).round() / 10.0;
+                if let Some(ref mut vr) = self.config.vr {
+                    vr.reminder_tone_freq = v;
+                }
+                if self.config.is_vr_mode() {
+                    if let Some(ref tone) = self.reminder_tone {
+                        tone.set_frequency(v);
+                        if !tone.is_playing() {
+                            if let Some(ref mut s) = self.settings_state {
+                                s.tone_was_already_playing = false;
+                            }
+                            tone.start();
+                        }
+                    }
+                }
+                self.mark_settings_dirty();
+                Task::none()
+            }
+            Message::SettingsVrReminderFreqReleased => {
+                if self.config.is_vr_mode() {
+                    if let Some(ref state) = self.settings_state {
+                        if !state.tone_was_already_playing {
+                            if let Some(ref tone) = self.reminder_tone {
+                                tone.stop();
+                            }
+                        }
+                    }
+                }
+                Task::none()
+            }
+            Message::SettingsVrRedDurationChanged(v) => {
+                let v = (v * 10.0).round() / 10.0;
+                if let Some(ref mut vr) = self.config.vr {
+                    vr.red_duration_seconds = v;
+                }
+                self.mark_settings_dirty();
+                Task::none()
+            }
+            Message::SettingsVrReminderVolumeChanged(v) => {
+                let v = (v * 100.0).round() / 100.0;
+                if let Some(ref mut vr) = self.config.vr {
+                    vr.reminder_tone_volume = v;
+                }
+                if self.config.is_vr_mode() {
+                    if let Some(ref tone) = self.reminder_tone {
+                        tone.set_volume(v);
+                        if !tone.is_playing() {
+                            if let Some(ref mut s) = self.settings_state {
+                                s.tone_was_already_playing = false;
+                            }
+                            tone.start();
+                        }
+                    }
+                }
+                self.mark_settings_dirty();
+                Task::none()
+            }
+            Message::SettingsVrReminderVolumeReleased => {
+                if self.config.is_vr_mode() {
+                    if let Some(ref state) = self.settings_state {
+                        if !state.tone_was_already_playing {
+                            if let Some(ref tone) = self.reminder_tone {
+                                tone.stop();
+                            }
+                        }
+                    }
+                }
+                Task::none()
+            }
+            Message::SettingsVrMicSensitivityChanged(v) => {
+                let v = v.round();
+                if let Some(ref mut vr) = self.config.vr {
+                    vr.mic_sensitivity = v;
+                }
+                if self.config.is_vr_mode() {
+                    let floor = config::mic_sensitivity_to_noise_floor(v);
+                    self.min_noise_floor
+                        .store(floor.to_bits(), Ordering::Relaxed);
+                }
+                self.mark_settings_dirty();
+                Task::none()
+            }
+            Message::SettingsVrSelectInputDevice(name) => {
+                if let Some(ref mut vr) = self.config.vr {
+                    vr.input_device_name = name.clone();
+                }
+                if self.config.is_vr_mode() {
+                    return self.update(Message::SelectInputDevice(name));
+                }
+                self.mark_settings_dirty();
+                Task::none()
+            }
+            Message::SettingsVrSelectOutputDevice(name) => {
+                if let Some(ref mut vr) = self.config.vr {
+                    vr.output_device_name = name.clone();
+                }
+                if self.config.is_vr_mode() {
+                    return self.update(Message::SelectOutputDevice(name));
+                }
+                self.mark_settings_dirty();
+                Task::none()
+            }
+            Message::SettingsVrFovDragged { x, y } => {
+                if let Some(ref mut vr) = self.config.vr {
+                    vr.vr_x = Some(x);
+                    vr.vr_y = Some(y);
+                }
+                self.mark_settings_dirty();
+                Task::none()
+            }
             Message::Noop => Task::none(),
+        }
+    }
+
+    /// Marks the settings state as dirty and records the change time.
+    fn mark_settings_dirty(&mut self) {
+        if let Some(ref mut s) = self.settings_state {
+            s.dirty = true;
+            s.last_change = Some(Instant::now());
         }
     }
 
@@ -1026,6 +1485,7 @@ impl PitchBrick {
                                 self.analysis_worker = audio::analysis::AnalysisWorker::spawn(
                                     self.audio_buffer.clone(),
                                     self.sample_rate,
+                                    self.min_noise_floor.clone(),
                                 );
                             }
                             Err(e) => tracing::error!("Failed to create VR audio capture: {}", e),
@@ -1083,6 +1543,7 @@ impl PitchBrick {
                             self.analysis_worker = audio::analysis::AnalysisWorker::spawn(
                                 self.audio_buffer.clone(),
                                 self.sample_rate,
+                                self.min_noise_floor.clone(),
                             );
                         }
                         Err(e) => tracing::error!("Failed to restore desktop audio capture: {}", e),
@@ -1134,13 +1595,16 @@ impl PitchBrick {
             vr_overlay_enabled: self.config.vr_overlay_enabled,
             vr_specific_settings: self.config.vr_specific_settings,
             vr_mode_active: self.vr_mode_active,
-            autostart_enabled: self.config.autostart,
+            vocal_rest_minutes: self.config.vocal_rest_minutes,
+            vocal_rest_trained_secs: self.vocal_rest.accumulated_ms(Instant::now()) / 1000,
         });
     }
 
     /// Returns a per-window title.
     pub fn title(&self, id: window::Id) -> String {
-        if Some(id) == self.update_window_id {
+        if Some(id) == self.settings_window_id {
+            "PitchBrick - Settings".to_string()
+        } else if Some(id) == self.update_window_id {
             "PitchBrick - Update".to_string()
         } else if Some(id) == self.shortcut_window_id {
             "PitchBrick - Shortcut".to_string()
@@ -1156,6 +1620,14 @@ impl PitchBrick {
     /// Main window: borderless colour-indicator canvas.
     /// Log window (verbose mode): scrollable monospace log lines.
     pub fn view(&self, id: window::Id) -> Element<'_, Message> {
+        if Some(id) == self.settings_window_id {
+            return crate::ui::settings_window::view(
+                &self.config,
+                &self.input_devices,
+                &self.output_devices,
+                self.config.autostart,
+            );
+        }
         if Some(id) == self.update_window_id {
             let new_ver = self
                 .update_available_version
@@ -1193,8 +1665,15 @@ impl PitchBrick {
             iced::Event::Window(window_event) => match window_event {
                 iced::window::Event::Moved(point) => Some(Message::WindowMoved(id, point)),
                 iced::window::Event::Resized(size) => Some(Message::WindowResized(id, size)),
+                iced::window::Event::CloseRequested => {
+                    Some(Message::WindowCloseRequested(id))
+                }
                 _ => None,
             },
+            // Left-click on any window → DragWindow (handler checks it's the main window).
+            iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
+                iced::mouse::Button::Left,
+            )) => Some(Message::DragWindow(id)),
             _ => None,
         });
 

@@ -8,16 +8,20 @@ use iced::mouse;
 use iced::widget::canvas::{self, Frame, Geometry};
 use iced::{Color, Rectangle, Renderer, Theme};
 
-/// The three possible display states for the pitch indicator.
+/// Display states for the pitch indicator.
 ///
 /// Each state maps to a specific color:
 /// - Green: voice is in the user's target gender range
+/// - Yellow: voice is in target range but vocal rest overage is active
 /// - Red: voice is in speech range but not the target gender
 /// - Black: no sound detected or frequency outside speech range (65-300 Hz)
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DisplayState {
     /// Voice frequency is within the target gender range.
     Green,
+    /// Voice is in target range but the user has exceeded their vocal rest
+    /// training threshold for this hour.
+    Yellow,
     /// Voice is detected but outside the target gender range.
     Red,
     /// No voice detected or frequency outside human speech range.
@@ -29,6 +33,7 @@ impl DisplayState {
     pub fn color(&self) -> Color {
         match self {
             DisplayState::Green => Color::from_rgb(0.0, 0.8, 0.0),
+            DisplayState::Yellow => Color::from_rgb(0.9, 0.8, 0.0),
             DisplayState::Red => Color::from_rgb(0.8, 0.0, 0.0),
             DisplayState::Black => Color::from_rgb(0.0, 0.0, 0.0),
         }
@@ -51,9 +56,9 @@ pub fn lerp_color(from: Color, to: Color, t: f32) -> Color {
 
 /// A canvas program that fills its entire bounds with a single color.
 ///
-/// Used as the main visual indicator for voice pitch state. The canvas
-/// detects mouse press events and emits `Message::DragWindow` so the
-/// user can drag the borderless window by clicking anywhere on it.
+/// Used as the main visual indicator for voice pitch state. Window drag
+/// is handled at the subscription level in app.rs to avoid interfering
+/// with iced's internal mouse tracking.
 pub struct DisplayCanvas {
     /// The current display color (interpolated between states).
     pub color: Color,
@@ -67,15 +72,13 @@ impl canvas::Program<Message> for DisplayCanvas {
     fn update(
         &self,
         _state: &mut Self::State,
-        event: &canvas::Event,
-        bounds: Rectangle,
-        cursor: mouse::Cursor,
+        _event: &canvas::Event,
+        _bounds: Rectangle,
+        _cursor: mouse::Cursor,
     ) -> Option<canvas::Action<Message>> {
-        if let canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) = event {
-            if cursor.position_in(bounds).is_some() {
-                return Some(canvas::Action::publish(Message::DragWindow));
-            }
-        }
+        // Drag is handled via the subscription-level mouse press listener
+        // in app.rs, not here. Using canvas::Action::publish/capture for
+        // drag interferes with iced's internal mouse tracking over time.
         None
     }
 
@@ -94,11 +97,20 @@ impl canvas::Program<Message> for DisplayCanvas {
             Some(hz) => format!("{:.0} Hz", hz),
             None => "Not Speaking".to_string(),
         };
+        // Scale font to fit within the window width (with padding).
+        // Upper bound 16px (never grow past default), lower bound 9px.
+        let max_size = 16.0_f32;
+        let min_size = 9.0_f32;
+        let padding = 8.0; // 4px each side
+        let chars = label.len() as f32;
+        // Approximate: each character is ~0.6× the font size in width.
+        let fit_size = (bounds.width - padding) / (chars * 0.6);
+        let font_size = fit_size.clamp(min_size, max_size);
         frame.fill_text(canvas::Text {
             content: label,
-            position: iced::Point::new(4.0, bounds.height - 22.0),
+            position: iced::Point::new(4.0, bounds.height - font_size - 6.0),
             color: Color::WHITE,
-            size: iced::Pixels(16.0),
+            size: iced::Pixels(font_size),
             ..canvas::Text::default()
         });
 
@@ -142,6 +154,11 @@ mod tests {
         assert_eq!(black.r, 0.0);
         assert_eq!(black.g, 0.0);
         assert_eq!(black.b, 0.0);
+
+        let yellow = DisplayState::Yellow.color();
+        assert!((yellow.r - 0.9).abs() < 0.001);
+        assert!((yellow.g - 0.8).abs() < 0.001);
+        assert_eq!(yellow.b, 0.0);
     }
 
     /// Verifies that lerp_color returns the exact start color at t=0

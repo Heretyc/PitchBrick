@@ -8,7 +8,7 @@
 use realfft::RealFftPlanner;
 use rustfft::num_complex::Complex;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -39,6 +39,8 @@ const VOICE_TRIGGER_MULTIPLIER: f32 = 6.0;
 const VOICE_HOLD_MULTIPLIER: f32 = 1.5;
 
 /// Minimum noise floor to prevent overly sensitive detection in noisy rooms.
+/// Kept as the default fallback value; runtime value is controlled via `Arc<AtomicU32>`.
+#[allow(dead_code)]
 const MIN_NOISE_FLOOR: f32 = 0.02;
 
 /// Real-time voice frequency analyzer using FFT with adaptive noise floor.
@@ -51,7 +53,10 @@ const MIN_NOISE_FLOOR: f32 = 0.02;
 ///
 /// ```
 /// use pitchbrick::audio::analysis::FrequencyAnalyzer;
-/// let mut analyzer = FrequencyAnalyzer::new(48000);
+/// use std::sync::atomic::AtomicU32;
+/// use std::sync::Arc;
+/// let noise_floor = Arc::new(AtomicU32::new(0.02_f32.to_bits()));
+/// let mut analyzer = FrequencyAnalyzer::new(48000, noise_floor);
 /// // Push 2048 samples of a 200 Hz sine wave
 /// let samples: Vec<f32> = (0..2048)
 ///     .map(|i| (2.0 * std::f32::consts::PI * 200.0 * i as f32 / 48000.0).sin())
@@ -72,6 +77,8 @@ pub struct FrequencyAnalyzer {
     noise_floor: f32,
     voice_active: bool,
     sample_rate: f32,
+    /// Dynamic minimum noise floor (f32 bits stored as u32). Updated from settings.
+    min_noise_floor: Arc<AtomicU32>,
 }
 
 impl FrequencyAnalyzer {
@@ -82,7 +89,7 @@ impl FrequencyAnalyzer {
     /// # Arguments
     ///
     /// * `sample_rate` - Audio sample rate in Hz (e.g., 44100 or 48000).
-    pub fn new(sample_rate: u32) -> Self {
+    pub fn new(sample_rate: u32, min_noise_floor: Arc<AtomicU32>) -> Self {
         let mut planner = RealFftPlanner::<f32>::new();
         let fft = planner.plan_fft_forward(FFT_SIZE);
         let fft_output = fft.make_output_vec();
@@ -108,6 +115,7 @@ impl FrequencyAnalyzer {
             noise_floor: 0.01,
             voice_active: false,
             sample_rate: sample_rate as f32,
+            min_noise_floor,
         }
     }
 
@@ -196,7 +204,8 @@ impl FrequencyAnalyzer {
             // Silence: update noise floor
             self.noise_floor =
                 self.noise_floor * (1.0 - NOISE_FLOOR_ALPHA) + frame_energy * NOISE_FLOOR_ALPHA;
-            self.noise_floor = self.noise_floor.max(MIN_NOISE_FLOOR);
+            let dynamic_floor = f32::from_bits(self.min_noise_floor.load(Ordering::Relaxed));
+            self.noise_floor = self.noise_floor.max(dynamic_floor);
             self.voice_active = false;
             return None;
         }
@@ -288,13 +297,17 @@ pub struct AnalysisWorker {
 impl AnalysisWorker {
     /// Spawns an analysis worker thread that continuously processes audio from the
     /// shared buffer and sends detected frequency results to the UI thread.
-    pub fn spawn(audio_buffer: Arc<Mutex<VecDeque<f32>>>, sample_rate: u32) -> Self {
+    pub fn spawn(
+        audio_buffer: Arc<Mutex<VecDeque<f32>>>,
+        sample_rate: u32,
+        min_noise_floor: Arc<AtomicU32>,
+    ) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_thread = shutdown.clone();
         let (tx, rx) = std::sync::mpsc::channel();
 
         std::thread::spawn(move || {
-            let mut analyzer = FrequencyAnalyzer::new(sample_rate);
+            let mut analyzer = FrequencyAnalyzer::new(sample_rate, min_noise_floor);
             loop {
                 if shutdown_thread.load(Ordering::Relaxed) {
                     break;
@@ -359,9 +372,13 @@ mod tests {
             .collect()
     }
 
+    fn test_noise_floor() -> Arc<AtomicU32> {
+        Arc::new(AtomicU32::new(MIN_NOISE_FLOOR.to_bits()))
+    }
+
     #[test]
     fn test_detect_200hz_sine() {
-        let mut analyzer = FrequencyAnalyzer::new(48000);
+        let mut analyzer = FrequencyAnalyzer::new(48000, test_noise_floor());
         // Push enough samples for multiple frames to let noise floor adapt
         let samples = sine_wave(200.0, 48000, 48000);
         analyzer.push_samples(&samples);
@@ -381,7 +398,7 @@ mod tests {
         // 100 Hz lands at min_bin (bin 4 = 93.75 Hz) where parabolic interpolation
         // is unavailable, producing a 6.25 Hz quantisation error.  110 Hz sits
         // between bins 4 and 5, safely off the boundary, so interpolation works.
-        let mut analyzer = FrequencyAnalyzer::new(48000);
+        let mut analyzer = FrequencyAnalyzer::new(48000, test_noise_floor());
         let samples = sine_wave(110.0, 48000, 48000);
         analyzer.push_samples(&samples);
         let results = analyzer.analyze();
@@ -397,7 +414,7 @@ mod tests {
 
     #[test]
     fn test_silence_returns_none() {
-        let mut analyzer = FrequencyAnalyzer::new(48000);
+        let mut analyzer = FrequencyAnalyzer::new(48000, test_noise_floor());
         let silence = vec![0.0f32; 4096];
         analyzer.push_samples(&silence);
         let results = analyzer.analyze();

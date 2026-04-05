@@ -7,6 +7,28 @@ use serde::{Deserialize, Serialize};
 fn default_true() -> bool {
     true
 }
+
+fn default_mic_sensitivity() -> f32 {
+    50.0
+}
+
+fn default_vocal_rest_minutes() -> u32 {
+    30
+}
+
+/// Maps mic sensitivity (1–100 slider) to a noise floor value.
+///
+/// 1 → 0.20 (least sensitive, high noise floor)
+/// 100 → 0.005 (most sensitive, low noise floor)
+/// Uses logarithmic interpolation for a natural feel.
+pub fn mic_sensitivity_to_noise_floor(sensitivity: f32) -> f32 {
+    let s = sensitivity.clamp(1.0, 100.0);
+    let t = (s - 1.0) / 99.0; // 0.0 at s=1, 1.0 at s=100
+    let low = 0.005_f32.ln();
+    let high = 0.20_f32.ln();
+    // t=0 → high (0.20), t=1 → low (0.005)
+    (high + (low - high) * t).exp()
+}
 use std::path::{Path, PathBuf};
 
 /// Minimum gap in Hz that must always separate male_freq_high and female_freq_low.
@@ -106,6 +128,8 @@ pub struct VrConfig {
     pub vr_height: Option<f32>,
     pub input_device_name: String,
     pub output_device_name: String,
+    #[serde(default = "default_mic_sensitivity")]
+    pub mic_sensitivity: f32,
 }
 
 impl Default for VrConfig {
@@ -125,6 +149,7 @@ impl Default for VrConfig {
             vr_height: None,
             input_device_name: String::new(),
             output_device_name: String::new(),
+            mic_sensitivity: 50.0,
         }
     }
 }
@@ -147,6 +172,7 @@ impl VrConfig {
             vr_height: config.window_height,
             input_device_name: config.input_device_name.clone(),
             output_device_name: config.output_device_name.clone(),
+            mic_sensitivity: config.mic_sensitivity,
         }
     }
 
@@ -219,6 +245,10 @@ pub struct Config {
     pub input_device_name: String,
     /// Name of the selected audio output device, or empty for system default.
     pub output_device_name: String,
+    /// Microphone sensitivity (1–100). Higher values lower the noise floor,
+    /// making the analyzer more sensitive to quiet speech.
+    #[serde(default = "default_mic_sensitivity")]
+    pub mic_sensitivity: f32,
     /// Whether the SteamVR overlay is enabled (requires vr-overlay feature at compile time).
     pub vr_overlay_enabled: bool,
     /// Whether VR-specific settings override desktop settings when the overlay is active.
@@ -240,6 +270,10 @@ pub struct Config {
     /// so it launches automatically on login.
     #[serde(default = "default_true")]
     pub autostart: bool,
+    /// Vocal rest threshold in minutes. `0` means OFF (no tracking/alerts).
+    /// Valid values: 0, 5, 10, 15, 20, 30, 40, 50. Default: 30.
+    #[serde(default = "default_vocal_rest_minutes")]
+    pub vocal_rest_minutes: u32,
 }
 
 impl Default for Config {
@@ -259,6 +293,7 @@ impl Default for Config {
             window_height: None,
             input_device_name: String::new(),
             output_device_name: String::new(),
+            mic_sensitivity: 50.0,
             vr_overlay_enabled: true,
             vr_specific_settings: false,
             vr: None,
@@ -266,6 +301,7 @@ impl Default for Config {
             update_last_checked_date: None,
             start_menu_shortcut_declined: false,
             autostart: true,
+            vocal_rest_minutes: 30,
         }
     }
 }
@@ -440,6 +476,15 @@ impl Config {
         }
     }
 
+    /// Returns the mic sensitivity for the active mode.
+    pub fn effective_mic_sensitivity(&self) -> f32 {
+        if self.is_vr_mode() {
+            self.vr.as_ref().unwrap().mic_sensitivity
+        } else {
+            self.mic_sensitivity
+        }
+    }
+
     /// Returns the output device name for the active mode.
     pub fn effective_output_device(&self) -> &str {
         if self.is_vr_mode() {
@@ -534,6 +579,7 @@ mod tests {
         assert_eq!(config.reminder_tone_freq, 165.0);
         assert!(!config.vr_specific_settings);
         assert!(config.vr.is_none());
+        assert_eq!(config.vocal_rest_minutes, 30);
     }
 
     #[test]
@@ -544,6 +590,16 @@ mod tests {
         assert_eq!(config.target_gender, deserialized.target_gender);
         assert_eq!(config.female_freq_low, deserialized.female_freq_low);
         assert_eq!(config.male_freq_high, deserialized.male_freq_high);
+        assert_eq!(config.vocal_rest_minutes, deserialized.vocal_rest_minutes);
+    }
+
+    #[test]
+    fn test_vocal_rest_off_round_trip() {
+        let mut config = Config::default();
+        config.vocal_rest_minutes = 0;
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        let deserialized: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(deserialized.vocal_rest_minutes, 0);
     }
 
     #[test]

@@ -11,6 +11,7 @@ mod shortcut;
 mod tray;
 mod ui;
 mod update;
+mod vocal_rest;
 #[cfg(feature = "vr-overlay")]
 mod vr;
 
@@ -29,6 +30,9 @@ struct Cli {
     /// Enable verbose logging to ~/pitchbrick-verbose.log and show a live log window
     #[arg(short, long)]
     verbose: bool,
+    /// Delete all user settings and data files, then exit.
+    #[arg(long)]
+    wipe_user_settings: bool,
 }
 
 /// Tracing subscriber layer that forwards formatted log lines to an mpsc channel.
@@ -110,6 +114,23 @@ fn main() -> iced::Result {
         screen_h,
         side
     );
+
+    if cli.wipe_user_settings {
+        let files = [
+            config::Config::path(),
+            vocal_rest::VocalRestTracker::path(),
+        ];
+        for path in &files {
+            if path.exists() {
+                match std::fs::remove_file(path) {
+                    Ok(()) => eprintln!("Deleted {}", path.display()),
+                    Err(e) => eprintln!("Failed to delete {}: {}", path.display(), e),
+                }
+            }
+        }
+        eprintln!("User settings wiped.");
+        std::process::exit(0);
+    }
 
     let (config, config_is_new) = config::Config::load(&config::Config::path());
     let main_width = config.window_width.unwrap_or(side);

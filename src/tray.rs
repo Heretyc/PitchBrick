@@ -18,6 +18,8 @@ use tray_icon::{
 pub enum TrayState {
     /// Voice is in target range (green).
     Green,
+    /// Voice is in target range but vocal rest overage is active (yellow).
+    Yellow,
     /// Voice is in the wrong direction (red).
     Red,
     /// Not speaking or no voice detected (gray).
@@ -39,6 +41,7 @@ pub enum UpdateMenuState {
     NetworkError,
 }
 
+#[allow(dead_code)]
 impl UpdateMenuState {
     /// Returns the menu item label text.
     pub fn label(&self) -> String {
@@ -69,12 +72,18 @@ pub enum TrayCommand {
         vr_overlay_enabled: bool,
         vr_specific_settings: bool,
         vr_mode_active: bool,
-        autostart_enabled: bool,
+        vocal_rest_minutes: u32,
+        vocal_rest_trained_secs: u64,
     },
     /// Update the tray icon color to reflect the current pitch state.
     SetState(TrayState),
     /// Update the "Check for updates" menu item text and enabled state.
     SetUpdateMenuState(UpdateMenuState),
+    /// Show a balloon (toast) notification with a custom title and message.
+    ShowBalloon { title: String, message: String },
+    /// Update the tray tooltip to reflect current training time without
+    /// rebuilding the menu (which would close an open context menu).
+    UpdateTooltip { vocal_rest_trained_secs: u64 },
     /// Switch to VR mode icon and show a balloon notification.
     EnterVrMode,
     /// Switch back to the color square icon and show a balloon notification.
@@ -90,14 +99,15 @@ pub struct TrayMenuIds {
     pub open_config: MenuId,
     pub vr_overlay_toggle: MenuId,
     pub vr_specific_settings_toggle: MenuId,
-    pub autostart_toggle: MenuId,
-    pub check_for_updates: MenuId,
     pub patreon: MenuId,
     pub quit: MenuId,
     /// `(menu_id, device_name)` pairs for input devices.
     pub input_devices: Vec<(MenuId, String)>,
     /// `(menu_id, device_name)` pairs for output devices.
     pub output_devices: Vec<(MenuId, String)>,
+    /// `(menu_id, threshold_minutes)` pairs for vocal rest threshold options.
+    /// 0 means OFF.
+    pub vocal_rest_items: Vec<(MenuId, u32)>,
 }
 
 /// Constructs a fresh native context menu reflecting the given state.
@@ -113,11 +123,11 @@ fn build_tray_menu(
     selected_output: &str,
     vr_overlay_enabled: bool,
     vr_specific_settings: bool,
-    autostart_enabled: bool,
-    update_state: &UpdateMenuState,
+    vocal_rest_minutes: u32,
+    vocal_rest_trained_secs: u64,
 ) -> (Menu, TrayMenuIds) {
     let gender_item = MenuItem::new(format!("Target: {}", gender), true, None);
-    let open_config_item = MenuItem::new("Open Config", true, None);
+    let open_config_item = MenuItem::new("Open Settings", true, None);
     let vr_label = if vr_overlay_enabled {
         "✓ Toggle SteamVR Overlay"
     } else {
@@ -160,14 +170,37 @@ fn build_tray_menu(
         output_submenu.append(&item).ok();
     }
 
-    let autostart_label = if autostart_enabled {
-        "✓ Start with Windows"
+    // --- Vocal rest submenu ---
+    let vocal_rest_label = if vocal_rest_minutes == 0 {
+        "Vocal Rest: OFF".to_string()
+    } else if vocal_rest_trained_secs < 60 {
+        format!("{} secs trained", vocal_rest_trained_secs)
     } else {
-        "  Start with Windows"
+        format!("{} mins trained", vocal_rest_trained_secs / 60)
     };
-    let autostart_item = MenuItem::new(autostart_label, true, None);
-
-    let update_item = MenuItem::new(update_state.label(), update_state.is_enabled(), None);
+    let vocal_rest_submenu = Submenu::new(&vocal_rest_label, true);
+    let mut vocal_rest_ids = Vec::new();
+    let options: &[(u32, &str)] = &[
+        (0, "Vocal rest OFF"),
+        (5, "5 minutes"),
+        (10, "10 minutes"),
+        (15, "15 minutes"),
+        (20, "20 minutes"),
+        (30, "30 minutes"),
+        (40, "40 minutes"),
+        (50, "50 minutes"),
+    ];
+    for &(value, label) in options {
+        let is_selected = value == vocal_rest_minutes;
+        let display = if is_selected {
+            format!("✓ {}", label)
+        } else {
+            format!("  {}", label)
+        };
+        let item = MenuItem::new(display, true, None);
+        vocal_rest_ids.push((item.id().clone(), value));
+        vocal_rest_submenu.append(&item).ok();
+    }
 
     let patreon_item = MenuItem::new("Written by Lexi", true, None);
     let quit_item = MenuItem::new("Quit", true, None);
@@ -177,12 +210,11 @@ fn build_tray_menu(
         open_config: open_config_item.id().clone(),
         vr_overlay_toggle: vr_overlay_item.id().clone(),
         vr_specific_settings_toggle: vr_settings_item.id().clone(),
-        autostart_toggle: autostart_item.id().clone(),
-        check_for_updates: update_item.id().clone(),
         patreon: patreon_item.id().clone(),
         quit: quit_item.id().clone(),
         input_devices: input_ids,
         output_devices: output_ids,
+        vocal_rest_items: vocal_rest_ids,
     };
 
     let menu = Menu::new();
@@ -193,9 +225,8 @@ fn build_tray_menu(
     menu.append(&PredefinedMenuItem::separator()).ok();
     menu.append(&input_submenu).ok();
     menu.append(&output_submenu).ok();
+    menu.append(&vocal_rest_submenu).ok();
     menu.append(&PredefinedMenuItem::separator()).ok();
-    menu.append(&autostart_item).ok();
-    menu.append(&update_item).ok();
     menu.append(&patreon_item).ok();
     menu.append(&PredefinedMenuItem::separator()).ok();
     menu.append(&quit_item).ok();
@@ -208,6 +239,7 @@ fn create_icon(state: TrayState) -> tray_icon::Icon {
     let side = 32u32;
     let color: [u8; 4] = match state {
         TrayState::Green    => [0x4C, 0xAF, 0x50, 0xFF],
+        TrayState::Yellow   => [0xFF, 0xEB, 0x3B, 0xFF],
         TrayState::Red      => [0xF4, 0x43, 0x36, 0xFF],
         TrayState::Inactive => [0x60, 0x60, 0x60, 0xFF],
     };
@@ -315,8 +347,8 @@ pub fn spawn_tray_thread(
     selected_output: String,
     vr_overlay_enabled: bool,
     vr_specific_settings: bool,
-    autostart_enabled: bool,
-    initial_update_state: UpdateMenuState,
+    vocal_rest_minutes: u32,
+    vocal_rest_trained_secs: u64,
 ) -> (std::sync::mpsc::Sender<TrayCommand>, Arc<Mutex<TrayMenuIds>>) {
     // ids_shared is populated by the thread once it builds the menu.
     // We pre-fill with a placeholder so the Arc exists before the thread starts.
@@ -325,12 +357,11 @@ pub fn spawn_tray_thread(
         open_config: MenuId::new("__placeholder__"),
         vr_overlay_toggle: MenuId::new("__placeholder__"),
         vr_specific_settings_toggle: MenuId::new("__placeholder__"),
-        autostart_toggle: MenuId::new("__placeholder__"),
-        check_for_updates: MenuId::new("__placeholder__"),
         patreon: MenuId::new("__placeholder__"),
         quit: MenuId::new("__placeholder__"),
         input_devices: Vec::new(),
         output_devices: Vec::new(),
+        vocal_rest_items: Vec::new(),
     };
     let ids_shared = Arc::new(Mutex::new(placeholder_ids));
     let ids_for_thread = Arc::clone(&ids_shared);
@@ -339,7 +370,6 @@ pub fn spawn_tray_thread(
 
     std::thread::spawn(move || {
         // Build menu inside the thread — muda::Menu is !Send due to Rc internals.
-        let mut current_update_state = initial_update_state;
         let (initial_menu, initial_ids) = build_tray_menu(
             gender,
             &input_devices,
@@ -348,8 +378,8 @@ pub fn spawn_tray_thread(
             &selected_output,
             vr_overlay_enabled,
             vr_specific_settings,
-            autostart_enabled,
-            &current_update_state,
+            vocal_rest_minutes,
+            vocal_rest_trained_secs,
         );
         let tooltip = format!("PitchBrick - Target: {}", gender);
 
@@ -404,7 +434,8 @@ pub fn spawn_tray_thread(
                             vr_overlay_enabled,
                             vr_specific_settings,
                             vr_mode_active,
-                            autostart_enabled,
+                            vocal_rest_minutes,
+                            vocal_rest_trained_secs,
                         } => {
                             let (new_menu, new_ids) = build_tray_menu(
                                 gender,
@@ -414,8 +445,8 @@ pub fn spawn_tray_thread(
                                 &selected_output,
                                 vr_overlay_enabled,
                                 vr_specific_settings,
-                                autostart_enabled,
-                                &current_update_state,
+                                vocal_rest_minutes,
+                                vocal_rest_trained_secs,
                             );
                             tray.set_menu(Some(Box::new(new_menu)));
                             let tooltip = format!("PitchBrick - Target: {}", gender);
@@ -426,13 +457,7 @@ pub fn spawn_tray_thread(
                             in_vr_mode = vr_mode_active;
                         }
                         TrayCommand::SetUpdateMenuState(state) => {
-                            current_update_state = state;
-                            // Rebuild the menu to update the item text/enabled state.
-                            // We don't have the full state here, so we just update the
-                            // existing menu item by rebuilding. This reuses the last
-                            // known gender/devices from the tray tooltip.
-                            // For simplicity, we send a balloon for available updates.
-                            if let UpdateMenuState::Available(ref v) = current_update_state {
+                            if let UpdateMenuState::Available(ref v) = state {
                                 show_balloon("PitchBrick", &format!("Update available: v{}", v));
                             }
                         }
@@ -441,6 +466,18 @@ pub fn spawn_tray_thread(
                             if !in_vr_mode {
                                 tray.set_icon(Some(create_icon(state))).ok();
                             }
+                        }
+                        TrayCommand::ShowBalloon { title, message } => {
+                            show_balloon(&title, &message);
+                        }
+                        TrayCommand::UpdateTooltip { vocal_rest_trained_secs } => {
+                            let time_str = if vocal_rest_trained_secs < 60 {
+                                format!("{} secs trained", vocal_rest_trained_secs)
+                            } else {
+                                format!("{} mins trained", vocal_rest_trained_secs / 60)
+                            };
+                            let tooltip = format!("PitchBrick - {}", time_str);
+                            tray.set_tooltip(Some(&tooltip)).ok();
                         }
                         TrayCommand::EnterVrMode => {
                             in_vr_mode = true;
