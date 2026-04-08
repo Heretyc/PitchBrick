@@ -17,7 +17,11 @@ fn default_vocal_rest_minutes() -> u32 {
 }
 
 fn default_ptt_key() -> String {
-    "`".to_string()
+    "F24".to_string()
+}
+
+fn default_gamepad_button() -> String {
+    "A".to_string()
 }
 
 /// Maps mic sensitivity (1–100 slider) to a noise floor value.
@@ -290,6 +294,16 @@ pub struct Config {
     /// Whether the user has acknowledged the first-time VR settings warning dialog.
     #[serde(default)]
     pub vr_dialog_shown: bool,
+    /// Whether virtual gamepad PTT output is enabled. `None` means never configured;
+    /// set to `Some(true)` when PTT-on-Green is first enabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gamepad_ptt: Option<bool>,
+    /// Xbox 360 button name for gamepad PTT (e.g., "A", "B", "X", "Y", "LB").
+    #[serde(default = "default_gamepad_button")]
+    pub gamepad_button: String,
+    /// Whether the user has permanently declined the ViGEmBus driver install prompt.
+    #[serde(default)]
+    pub gamepad_declined: bool,
 }
 
 impl Default for Config {
@@ -319,9 +333,12 @@ impl Default for Config {
             autostart: true,
             vocal_rest_minutes: 30,
             ptt_on_green: false,
-            ptt_key: "`".to_string(),
+            ptt_key: "F24".to_string(),
             ptt_dialog_shown: false,
             vr_dialog_shown: false,
+            gamepad_ptt: None,
+            gamepad_button: "A".to_string(),
+            gamepad_declined: false,
         }
     }
 }
@@ -599,11 +616,14 @@ mod tests {
         assert_eq!(config.reminder_tone_freq, 165.0);
         assert_eq!(config.reminder_tone_volume, 0.75);
         assert!(!config.ptt_on_green);
-        assert_eq!(config.ptt_key, "`");
+        assert_eq!(config.ptt_key, "F24");
         assert!(!config.ptt_dialog_shown);
         assert!(!config.vr_specific_settings);
         assert!(config.vr.is_none());
         assert_eq!(config.vocal_rest_minutes, 30);
+        assert!(config.gamepad_ptt.is_none());
+        assert_eq!(config.gamepad_button, "A");
+        assert!(!config.gamepad_declined);
     }
 
     #[test]

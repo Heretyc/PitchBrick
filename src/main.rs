@@ -7,6 +7,7 @@ mod app;
 mod audio;
 mod autostart;
 mod config;
+mod gamepad;
 mod ptt;
 mod shortcut;
 mod tray;

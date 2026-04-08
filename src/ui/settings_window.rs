@@ -721,6 +721,14 @@ fn build_column<'a>(
             .spacing(8)
             .align_y(Alignment::Center);
         col = col.push(ptt_row);
+
+        // Gamepad button diagram (shown when gamepad PTT is enabled).
+        if config.gamepad_ptt == Some(true) {
+            let gamepad_label = text("Gamepad Button:").size(12);
+            let controller_view = crate::ui::controller_diagram::view(&config.gamepad_button);
+            col = col.push(gamepad_label);
+            col = col.push(controller_view);
+        }
     }
 
     col.into()

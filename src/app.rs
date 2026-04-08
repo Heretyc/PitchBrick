@@ -154,6 +154,16 @@ pub enum Message {
     /// User confirmed the wipe by clicking "DELETE EVERYTHING".
     ConfirmWipeSettings,
 
+    // ── Gamepad ──
+    /// User accepted the ViGEmBus driver install prompt.
+    AcceptVigemInstall,
+    /// User declined the ViGEmBus driver install prompt.
+    DeclineVigemInstall,
+    /// The ViGEmBus install dialog window was opened.
+    VigemDialogWindowOpened(window::Id),
+    /// User selected a different gamepad button in the controller diagram.
+    SettingsGamepadButtonChanged(String),
+
     /// Discards a task result with no side effect.
     Noop,
 }
@@ -268,6 +278,14 @@ pub struct PitchBrick {
     pub settings_version: u64,
     /// Timestamp of the last Tick message, used to detect slow frames.
     pub last_tick: Instant,
+    /// Command sender for the virtual gamepad thread (None if not connected or disabled).
+    pub gamepad_tx: Option<std::sync::mpsc::Sender<crate::gamepad::GamepadCommand>>,
+    /// Receiver for a pending gamepad connection attempt result.
+    pub gamepad_connect_rx: Option<std::sync::mpsc::Receiver<crate::gamepad::GamepadConnectResult>>,
+    /// Window ID of the ViGEmBus install dialog.
+    pub vigem_dialog_window_id: Option<window::Id>,
+    /// Receiver for a pending ViGEmBus install result.
+    pub vigem_install_rx: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
 }
 
 impl PitchBrick {
@@ -502,6 +520,10 @@ impl PitchBrick {
             wipe_dialog_window_id: None,
             settings_version: 0,
             last_tick: Instant::now(),
+            gamepad_tx: None,
+            gamepad_connect_rx: None,
+            vigem_dialog_window_id: None,
+            vigem_install_rx: None,
         };
 
         // Check Start Menu shortcut and open dialog if mismatched.
@@ -811,23 +833,15 @@ impl PitchBrick {
 
                         if alert_condition_met && self.ptt_held {
                             // Alert fired → instant release, overrides minimum activation.
-                            if let Some(vk) =
-                                crate::ptt::key_name_to_vk(&self.config.ptt_key)
-                            {
-                                crate::ptt::release_key(vk);
-                                tracing::debug!("PTT: released (alert condition met)");
-                            }
+                            self.ptt_release();
+                            tracing::debug!("PTT: released (alert condition met)");
                             self.ptt_held = false;
                             self.ptt_press_start = None;
                             self.ptt_release_timer = None;
                         } else if want_active {
                             if !self.ptt_held {
-                                if let Some(vk) =
-                                    crate::ptt::key_name_to_vk(&self.config.ptt_key)
-                                {
-                                    crate::ptt::press_key(vk);
-                                    tracing::debug!("PTT: pressed");
-                                }
+                                self.ptt_press();
+                                tracing::debug!("PTT: pressed");
                                 self.ptt_held = true;
                                 self.ptt_press_start = Some(now);
                             }
@@ -850,12 +864,8 @@ impl PitchBrick {
                                 });
 
                             if silence_grace_met && min_activation_met {
-                                if let Some(vk) =
-                                    crate::ptt::key_name_to_vk(&self.config.ptt_key)
-                                {
-                                    crate::ptt::release_key(vk);
-                                    tracing::debug!("PTT: released (silence grace expired)");
-                                }
+                                self.ptt_release();
+                                tracing::debug!("PTT: released (silence grace expired)");
                                 self.ptt_held = false;
                                 self.ptt_press_start = None;
                                 self.ptt_release_timer = None;
@@ -863,12 +873,8 @@ impl PitchBrick {
                         }
                     } else if self.ptt_held {
                         // PTT was disabled while held → release immediately.
-                        if let Some(vk) =
-                            crate::ptt::key_name_to_vk(&self.config.ptt_key)
-                        {
-                            crate::ptt::release_key(vk);
-                            tracing::debug!("PTT: released (feature disabled)");
-                        }
+                        self.ptt_release();
+                        tracing::debug!("PTT: released (feature disabled)");
                         self.ptt_held = false;
                         self.ptt_press_start = None;
                         self.ptt_release_timer = None;
@@ -1042,6 +1048,67 @@ impl PitchBrick {
                     Task::none()
                 };
 
+                // --- Gamepad: poll connection attempt result ---
+                let mut gamepad_task = Task::none();
+                if let Some(ref rx) = self.gamepad_connect_rx {
+                    if let Ok(result) = rx.try_recv() {
+                        self.gamepad_connect_rx = None;
+                        match result {
+                            crate::gamepad::GamepadConnectResult::Connected(tx) => {
+                                self.gamepad_tx = Some(tx);
+                                tracing::info!("Gamepad: virtual controller connected");
+                            }
+                            crate::gamepad::GamepadConnectResult::DriverMissing => {
+                                tracing::info!("Gamepad: ViGEmBus driver not installed");
+                                if !self.config.gamepad_declined
+                                    && self.vigem_dialog_window_id.is_none()
+                                {
+                                    let (win_id, open_task) = window::open(window::Settings {
+                                        size: Size::new(480.0, 280.0),
+                                        resizable: false,
+                                        decorations: true,
+                                        exit_on_close_request: false,
+                                        ..Default::default()
+                                    });
+                                    self.vigem_dialog_window_id = Some(win_id);
+                                    gamepad_task =
+                                        open_task.map(Message::VigemDialogWindowOpened);
+                                }
+                            }
+                            crate::gamepad::GamepadConnectResult::Error(msg) => {
+                                tracing::error!("Gamepad: connection error: {}", msg);
+                            }
+                        }
+                    }
+                }
+
+                // --- Gamepad: poll ViGEmBus install result ---
+                if let Some(ref rx) = self.vigem_install_rx {
+                    if let Ok(result) = rx.try_recv() {
+                        self.vigem_install_rx = None;
+                        match result {
+                            Ok(()) => {
+                                tracing::info!("Gamepad: ViGEmBus installed, retrying connection");
+                                let _ = self.tray_command_tx.send(TrayCommand::ShowBalloon {
+                                    title: "PitchBrick".to_string(),
+                                    message: "ViGEmBus driver installed successfully.".to_string(),
+                                });
+                                self.try_start_gamepad();
+                            }
+                            Err(msg) => {
+                                tracing::error!("Gamepad: ViGEmBus install failed: {}", msg);
+                                let _ = self.tray_command_tx.send(TrayCommand::ShowBalloon {
+                                    title: "PitchBrick".to_string(),
+                                    message: format!(
+                                        "ViGEmBus install failed: {}. Keyboard PTT still works.",
+                                        msg
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                }
+
                 // --- Settings window: 5-second debounced save ---
                 if let Some(ref mut state) = self.settings_state {
                     if state.dirty {
@@ -1058,7 +1125,7 @@ impl PitchBrick {
                     }
                 }
 
-                Task::batch([update_task, log_task])
+                Task::batch([update_task, log_task, gamepad_task])
             }
             Message::DragWindow(id) => {
                 // Only drag the main window, not settings/log/dialog windows.
@@ -1317,6 +1384,10 @@ impl PitchBrick {
                         ..Default::default()
                     });
                     self.ptt_dialog_window_id = Some(win_id);
+                    // Auto-enable gamepad on first PTT activation.
+                    if self.config.gamepad_ptt.is_none() {
+                        self.config.gamepad_ptt = Some(true);
+                    }
                     self.config.save(&Config::path());
                     self.config_last_modified = std::fs::metadata(Config::path())
                         .ok()
@@ -1326,14 +1397,21 @@ impl PitchBrick {
                     return open_task.map(Message::PttDialogWindowOpened);
                 }
 
-                // Turning off: release key if held.
-                if !self.config.ptt_on_green && self.ptt_held {
-                    if let Some(vk) = crate::ptt::key_name_to_vk(&self.config.ptt_key) {
-                        crate::ptt::release_key(vk);
+                if self.config.ptt_on_green {
+                    // Turning on (dialog already shown): start gamepad.
+                    if self.config.gamepad_ptt.is_none() {
+                        self.config.gamepad_ptt = Some(true);
                     }
-                    self.ptt_held = false;
-                    self.ptt_press_start = None;
-                    self.ptt_release_timer = None;
+                    self.try_start_gamepad();
+                } else {
+                    // Turning off: release key if held and stop gamepad.
+                    if self.ptt_held {
+                        self.ptt_release();
+                        self.ptt_held = false;
+                        self.ptt_press_start = None;
+                        self.ptt_release_timer = None;
+                    }
+                    self.stop_gamepad();
                 }
 
                 self.config.save(&Config::path());
@@ -1351,6 +1429,8 @@ impl PitchBrick {
                     .ok()
                     .and_then(|m| m.modified().ok());
                 tracing::info!("PTT dialog acknowledged, PTT now active");
+                // Now that PTT is fully active, start the gamepad.
+                self.try_start_gamepad();
                 if let Some(id) = self.ptt_dialog_window_id.take() {
                     window::close(id)
                 } else {
@@ -1420,11 +1500,11 @@ impl PitchBrick {
             Message::QuitRequested => {
                 // Release PTT key before quitting.
                 if self.ptt_held {
-                    if let Some(vk) = crate::ptt::key_name_to_vk(&self.config.ptt_key) {
-                        crate::ptt::release_key(vk);
-                    }
+                    self.ptt_release();
                     self.ptt_held = false;
                 }
+                // Stop the virtual gamepad.
+                self.stop_gamepad();
                 // Save any pending settings changes before quitting.
                 if let Some(ref state) = self.settings_state {
                     if state.dirty {
@@ -1605,6 +1685,17 @@ impl PitchBrick {
                         self.send_tray_rebuild();
                     }
                     self.ptt_dialog_window_id = None;
+                    return window::close(id);
+                }
+                // ViGEmBus dialog close — treat as decline
+                if Some(id) == self.vigem_dialog_window_id {
+                    self.config.gamepad_declined = true;
+                    self.config.gamepad_ptt = Some(false);
+                    self.config.save(&Config::path());
+                    self.config_last_modified = std::fs::metadata(Config::path())
+                        .ok()
+                        .and_then(|m| m.modified().ok());
+                    self.vigem_dialog_window_id = None;
                     return window::close(id);
                 }
                 // Wipe dialog close — just dismiss, no side effects
@@ -1840,7 +1931,102 @@ impl PitchBrick {
                 self.mark_settings_dirty();
                 Task::none()
             }
+            Message::AcceptVigemInstall => {
+                // Close the dialog.
+                let close_task = if let Some(id) = self.vigem_dialog_window_id.take() {
+                    window::close(id)
+                } else {
+                    Task::none()
+                };
+                // Spawn background install thread.
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::Builder::new()
+                    .name("vigem-install".into())
+                    .spawn(move || {
+                        let result = crate::gamepad::download_and_install_vigembus();
+                        let _ = tx.send(result);
+                    })
+                    .ok();
+                self.vigem_install_rx = Some(rx);
+                tracing::info!("Gamepad: ViGEmBus install started");
+                close_task
+            }
+            Message::DeclineVigemInstall => {
+                self.config.gamepad_declined = true;
+                self.config.gamepad_ptt = Some(false);
+                self.config.save(&Config::path());
+                self.config_last_modified = std::fs::metadata(Config::path())
+                    .ok()
+                    .and_then(|m| m.modified().ok());
+                tracing::info!("Gamepad: user declined ViGEmBus install");
+                if let Some(id) = self.vigem_dialog_window_id.take() {
+                    window::close(id)
+                } else {
+                    Task::none()
+                }
+            }
+            Message::VigemDialogWindowOpened(id) => {
+                self.vigem_dialog_window_id = Some(id);
+                window::gain_focus(id)
+            }
+            Message::SettingsGamepadButtonChanged(button) => {
+                self.config.gamepad_button = button;
+                tracing::info!("Gamepad button changed to '{}'", self.config.gamepad_button);
+                self.mark_settings_dirty();
+                Task::none()
+            }
             Message::Noop => Task::none(),
+        }
+    }
+
+    /// Presses both the keyboard key and the virtual gamepad button for PTT.
+    fn ptt_press(&self) {
+        if let Some(vk) = crate::ptt::key_name_to_vk(&self.config.ptt_key) {
+            crate::ptt::press_key(vk);
+        }
+        if let Some(ref tx) = self.gamepad_tx {
+            if let Some(xb) = crate::gamepad::button_name_to_xbuttons(&self.config.gamepad_button) {
+                let _ = tx.send(crate::gamepad::GamepadCommand::Press(xb));
+            }
+        }
+    }
+
+    /// Releases both the keyboard key and the virtual gamepad button for PTT.
+    fn ptt_release(&self) {
+        if let Some(vk) = crate::ptt::key_name_to_vk(&self.config.ptt_key) {
+            crate::ptt::release_key(vk);
+        }
+        if let Some(ref tx) = self.gamepad_tx {
+            let _ = tx.send(crate::gamepad::GamepadCommand::Release);
+        }
+    }
+
+    /// Attempts to start the virtual gamepad in a background thread.
+    /// Stores the result receiver for polling in the Tick handler.
+    fn try_start_gamepad(&mut self) {
+        if self.config.gamepad_ptt != Some(true) || self.config.gamepad_declined {
+            return;
+        }
+        if self.gamepad_tx.is_some() || self.gamepad_connect_rx.is_some() {
+            return; // Already connected or connection in progress.
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("gamepad-connect".into())
+            .spawn(move || {
+                let result = crate::gamepad::try_connect();
+                let _ = tx.send(result);
+            })
+            .ok();
+        self.gamepad_connect_rx = Some(rx);
+        tracing::info!("Gamepad: connection attempt started");
+    }
+
+    /// Stops the virtual gamepad thread and unplugs the controller.
+    fn stop_gamepad(&mut self) {
+        if let Some(tx) = self.gamepad_tx.take() {
+            let _ = tx.send(crate::gamepad::GamepadCommand::Quit);
+            tracing::info!("Gamepad: quit sent, controller will unplug");
         }
     }
 
@@ -2009,6 +2195,8 @@ impl PitchBrick {
             "PitchBrick - Shortcut".to_string()
         } else if Some(id) == self.ptt_dialog_window_id {
             "PitchBrick - Push-to-Talk".to_string()
+        } else if Some(id) == self.vigem_dialog_window_id {
+            "PitchBrick - Gamepad Driver".to_string()
         } else if Some(id) == self.vr_dialog_window_id {
             "PitchBrick - VR Settings".to_string()
         } else if Some(id) == self.wipe_dialog_window_id {
@@ -2049,6 +2237,9 @@ impl PitchBrick {
         }
         if Some(id) == self.ptt_dialog_window_id {
             return crate::ui::ptt_dialog::view();
+        }
+        if Some(id) == self.vigem_dialog_window_id {
+            return crate::ui::gamepad_dialog::view();
         }
         if Some(id) == self.vr_dialog_window_id {
             return crate::ui::vr_dialog::view();

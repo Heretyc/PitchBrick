@@ -1,6 +1,6 @@
 [package]
 name = "pitchbrick"
-version = "2.5.0"
+version = "2.5.5"
 edition = "2021"
 license = "Apache-2.0"
 description = "Transgender vocal training pitch monitor"
@@ -14,6 +14,7 @@ include = [
     "sounds/**",
     "docs/logo.ico",
     "docs/vr-mode.ico",
+    "src/images/**",
     "build.rs",
     "LICENSE",
     "README.md",
@@ -25,7 +26,8 @@ default = ["vr-overlay"]
 vr-overlay = ["dep:libloading"]
 
 [dependencies]
-iced = { version = "0.14", features = ["canvas", "tokio"] }
+iced = { version = "0.14", features = ["canvas", "tokio", "image"] }
+image = "0.25"
 cpal = "0.17"
 realfft = "3.5"
 rustfft = "6.4"
@@ -44,6 +46,7 @@ rodio = { version = "0.19", default-features = false, features = ["wav"] }
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = ["Win32_UI_WindowsAndMessaging", "Win32_System_Registry", "Win32_UI_Shell", "Win32_System_Com", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp", "Win32_Foundation", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Threading"] }
 tray-icon = "0.21"
+vigem-client = "0.1"
 
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"
