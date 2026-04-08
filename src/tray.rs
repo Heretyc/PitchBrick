@@ -74,6 +74,7 @@ pub enum TrayCommand {
         vr_mode_active: bool,
         vocal_rest_minutes: u32,
         vocal_rest_trained_secs: u64,
+        ptt_on_green: bool,
     },
     /// Update the tray icon color to reflect the current pitch state.
     SetState(TrayState),
@@ -99,6 +100,7 @@ pub struct TrayMenuIds {
     pub open_config: MenuId,
     pub vr_overlay_toggle: MenuId,
     pub vr_specific_settings_toggle: MenuId,
+    pub ptt_on_green_toggle: MenuId,
     pub patreon: MenuId,
     pub quit: MenuId,
     /// `(menu_id, device_name)` pairs for input devices.
@@ -125,6 +127,7 @@ fn build_tray_menu(
     vr_specific_settings: bool,
     vocal_rest_minutes: u32,
     vocal_rest_trained_secs: u64,
+    ptt_on_green: bool,
 ) -> (Menu, TrayMenuIds) {
     let gender_item = MenuItem::new(format!("Target: {}", gender), true, None);
     let open_config_item = MenuItem::new("Open Settings", true, None);
@@ -202,6 +205,13 @@ fn build_tray_menu(
         vocal_rest_submenu.append(&item).ok();
     }
 
+    let ptt_label = if ptt_on_green {
+        "✓ Push-to-Talk on Green"
+    } else {
+        "  Push-to-Talk on Green"
+    };
+    let ptt_item = MenuItem::new(ptt_label, true, None);
+
     let patreon_item = MenuItem::new("Written by Lexi", true, None);
     let quit_item = MenuItem::new("Quit", true, None);
 
@@ -210,6 +220,7 @@ fn build_tray_menu(
         open_config: open_config_item.id().clone(),
         vr_overlay_toggle: vr_overlay_item.id().clone(),
         vr_specific_settings_toggle: vr_settings_item.id().clone(),
+        ptt_on_green_toggle: ptt_item.id().clone(),
         patreon: patreon_item.id().clone(),
         quit: quit_item.id().clone(),
         input_devices: input_ids,
@@ -222,6 +233,7 @@ fn build_tray_menu(
     menu.append(&open_config_item).ok();
     menu.append(&vr_overlay_item).ok();
     menu.append(&vr_settings_item).ok();
+    menu.append(&ptt_item).ok();
     menu.append(&PredefinedMenuItem::separator()).ok();
     menu.append(&input_submenu).ok();
     menu.append(&output_submenu).ok();
@@ -349,6 +361,7 @@ pub fn spawn_tray_thread(
     vr_specific_settings: bool,
     vocal_rest_minutes: u32,
     vocal_rest_trained_secs: u64,
+    ptt_on_green: bool,
 ) -> (std::sync::mpsc::Sender<TrayCommand>, Arc<Mutex<TrayMenuIds>>) {
     // ids_shared is populated by the thread once it builds the menu.
     // We pre-fill with a placeholder so the Arc exists before the thread starts.
@@ -357,6 +370,7 @@ pub fn spawn_tray_thread(
         open_config: MenuId::new("__placeholder__"),
         vr_overlay_toggle: MenuId::new("__placeholder__"),
         vr_specific_settings_toggle: MenuId::new("__placeholder__"),
+        ptt_on_green_toggle: MenuId::new("__placeholder__"),
         patreon: MenuId::new("__placeholder__"),
         quit: MenuId::new("__placeholder__"),
         input_devices: Vec::new(),
@@ -380,6 +394,7 @@ pub fn spawn_tray_thread(
             vr_specific_settings,
             vocal_rest_minutes,
             vocal_rest_trained_secs,
+            ptt_on_green,
         );
         let tooltip = format!("PitchBrick - Target: {}", gender);
 
@@ -436,6 +451,7 @@ pub fn spawn_tray_thread(
                             vr_mode_active,
                             vocal_rest_minutes,
                             vocal_rest_trained_secs,
+                            ptt_on_green,
                         } => {
                             let (new_menu, new_ids) = build_tray_menu(
                                 gender,
@@ -447,6 +463,7 @@ pub fn spawn_tray_thread(
                                 vr_specific_settings,
                                 vocal_rest_minutes,
                                 vocal_rest_trained_secs,
+                                ptt_on_green,
                             );
                             tray.set_menu(Some(Box::new(new_menu)));
                             let tooltip = format!("PitchBrick - Target: {}", gender);

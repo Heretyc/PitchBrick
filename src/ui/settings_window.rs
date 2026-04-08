@@ -63,7 +63,7 @@ pub struct FrequencySliderCanvas {
 const FREQ_MIN: f32 = 70.0;
 const FREQ_MAX: f32 = 300.0;
 const SLIDER_PAD: f32 = 20.0;
-const HANDLE_RADIUS: f32 = 6.0;
+const HANDLE_RADIUS: f32 = 12.0;
 
 impl FrequencySliderCanvas {
     fn freq_to_x(&self, freq: f32, width: f32) -> f32 {
@@ -85,7 +85,7 @@ impl FrequencySliderCanvas {
             (FreqHandle::FemaleHigh, self.female_high),
         ];
         let mut best = None;
-        let mut best_dist = 12.0_f32; // max pixel distance to grab
+        let mut best_dist = 20.0_f32; // max pixel distance to grab
         for (handle, freq) in &handles {
             let hx = self.freq_to_x(*freq, width);
             let dist = (x - hx).abs();
@@ -338,33 +338,30 @@ impl canvas::Program<Message> for VrFovCanvas {
         match event {
             canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 if let Some(pos) = cursor.position_in(bounds) {
-                    let (ox, oy, ow, oh) = self.overlay_rect();
-                    if pos.x >= ox && pos.x <= ox + ow && pos.y >= oy && pos.y <= oy + oh {
-                        state.dragging = true;
-                        state.drag_offset = (pos.x - ox, pos.y - oy);
-                        return Some(canvas::Action::capture());
-                    }
+                    let (_ox, _oy, ow, oh) = self.overlay_rect();
+                    // Start dragging from anywhere on the canvas — center the
+                    // overlay on the click position for easy repositioning.
+                    state.dragging = true;
+                    state.drag_offset = (ow / 2.0, oh / 2.0);
+                    let new_sx = (pos.x - ow / 2.0).clamp(0.0, FOV_W - ow);
+                    let new_sy = (pos.y - oh / 2.0).clamp(0.0, FOV_H - oh);
+                    state.live_pos = Some((new_sx, new_sy));
+                    return Some(canvas::Action::capture());
                 }
             }
             canvas::Event::Mouse(mouse::Event::CursorMoved { .. }) => {
                 if state.dragging {
                     if let Some(pos) = cursor.position_in(bounds) {
-                        let new_sx = pos.x - state.drag_offset.0;
-                        let new_sy = pos.y - state.drag_offset.1;
-                        // Only update the canvas state for immediate visual feedback;
-                        // config is committed on release to avoid flooding the event
-                        // loop and causing UI freezes.
+                        let (_ox, _oy, ow, oh) = self.overlay_rect();
+                        let new_sx = (pos.x - state.drag_offset.0).clamp(0.0, FOV_W - ow);
+                        let new_sy = (pos.y - state.drag_offset.1).clamp(0.0, FOV_H - oh);
                         state.live_pos = Some((new_sx, new_sy));
-                        // request_redraw() ensures the canvas repaints this frame.
-                        // Do NOT capture — iced needs CursorMoved to propagate for
-                        // internal cursor tracking; capturing it freezes the UI.
                         return Some(canvas::Action::request_redraw());
                     }
                 }
             }
             canvas::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
                 if state.dragging {
-                    // Commit final position to config.
                     let msg = if let Some((sx, sy)) = state.live_pos {
                         let x = (sx / FOV_W * SCREEN_W) as i32;
                         let y = (sy / FOV_H * SCREEN_H) as i32;
@@ -442,11 +439,8 @@ impl canvas::Program<Message> for VrFovCanvas {
         if state.dragging {
             return mouse::Interaction::Grabbing;
         }
-        if let Some(pos) = cursor.position_in(bounds) {
-            let (ox, oy, ow, oh) = self.overlay_rect();
-            if pos.x >= ox && pos.x <= ox + ow && pos.y >= oy && pos.y <= oy + oh {
-                return mouse::Interaction::Grab;
-            }
+        if cursor.position_in(bounds).is_some() {
+            return mouse::Interaction::Grab;
         }
         mouse::Interaction::default()
     }
@@ -578,7 +572,7 @@ fn build_column<'a>(
         is_vr,
     })
     .width(Length::Fill)
-    .height(Length::Fixed(50.0));
+    .height(Length::Fixed(55.0));
 
     // Reminder Freq slider (70-300)
     let reminder_freq_row = {
@@ -699,7 +693,7 @@ fn build_column<'a>(
         row![label, pick].spacing(8).align_y(Alignment::Center)
     };
 
-    column![
+    let mut col = column![
         gender_btn,
         freq_slider,
         reminder_freq_row,
@@ -710,11 +704,26 @@ fn build_column<'a>(
         output_pick,
     ]
     .spacing(6)
-    .width(Length::Fill)
-    .into()
+    .width(Length::Fill);
+
+    if !is_vr {
+        let ptt_key_label = text("PTT Key:").size(12);
+        let keys = crate::ptt::AVAILABLE_KEYS;
+        let selected = keys.iter().copied().find(|&k| k == config.ptt_key);
+        let ptt_pick = pick_list(keys, selected, |key: &str| {
+            Message::SettingsPttKeyChanged(key.to_string())
+        })
+        .text_size(12);
+        let ptt_row = row![ptt_key_label, ptt_pick]
+            .spacing(8)
+            .align_y(Alignment::Center);
+        col = col.push(ptt_row);
+    }
+
+    col.into()
 }
 
-/// Builds the VR settings column with enable toggle and FOV editor.
+/// Builds the VR settings column with overlay toggle, FOV editor, and VR-specific settings.
 fn build_vr_column<'a>(
     config: &Config,
     input_devices: &[String],
@@ -722,63 +731,44 @@ fn build_vr_column<'a>(
 ) -> Element<'a, Message> {
     let vr_enabled = config.vr_specific_settings;
     let has_vr = config.vr.is_some();
+    let overlay_enabled = config.vr_overlay_enabled;
 
     let heading = text("VR Settings").size(15);
 
-    let enable_toggle = checkbox(vr_enabled)
-        .label("Enable VR Settings")
-        .on_toggle(|_| Message::SettingsToggleVrEnabled)
+    // SteamVR overlay toggle — controls whether the FOV canvas is active.
+    let overlay_toggle = checkbox(overlay_enabled)
+        .label("Toggle SteamVR Overlay")
+        .on_toggle(|_| Message::SettingsToggleVrOverlay)
         .size(14)
         .text_size(13);
 
-    if !vr_enabled || !has_vr {
-        // Show greyed-out placeholder column
-        let disabled_slider = Canvas::new(FrequencySliderCanvas {
-            male_low: 85.0,
-            male_high: 155.0,
-            female_low: 165.0,
-            female_high: 255.0,
-            target_gender: Gender::Female,
-            disabled: true,
-            is_vr: true,
-        })
-        .width(Length::Fill)
-        .height(Length::Fixed(50.0));
-
-        let fov = Canvas::new(VrFovCanvas {
-            vr_x: 0,
-            vr_y: 0,
-            vr_width: 200.0,
-            vr_height: 200.0,
-            disabled: true,
-        })
-        .width(Length::Fixed(FOV_W))
-        .height(Length::Fixed(FOV_H));
-
-        return column![heading, enable_toggle, disabled_slider, fov]
-            .spacing(6)
-            .width(Length::Fill)
-            .into();
-    }
-
-    let vr = config.vr.as_ref().unwrap();
-
-    // Active VR settings column
-    let settings_col = build_column(config, input_devices, output_devices, true);
-
-    // FOV canvas
+    // FOV canvas — active when overlay is enabled, regardless of VR-specific settings.
+    let vr_for_fov = config.vr.as_ref();
     let fov = Canvas::new(VrFovCanvas {
-        vr_x: vr.vr_x.unwrap_or(0),
-        vr_y: vr.vr_y.unwrap_or(0),
-        vr_width: vr.vr_width.unwrap_or(200.0),
-        vr_height: vr.vr_height.unwrap_or(200.0),
-        disabled: false,
+        vr_x: vr_for_fov.and_then(|v| v.vr_x).unwrap_or(0),
+        vr_y: vr_for_fov.and_then(|v| v.vr_y).unwrap_or(0),
+        vr_width: vr_for_fov.and_then(|v| v.vr_width).unwrap_or(200.0),
+        vr_height: vr_for_fov.and_then(|v| v.vr_height).unwrap_or(200.0),
+        disabled: !overlay_enabled,
     })
     .width(Length::Fixed(FOV_W))
     .height(Length::Fixed(FOV_H));
 
-    column![heading, enable_toggle, settings_col, fov]
+    // VR-specific settings toggle.
+    let vr_settings_toggle = checkbox(vr_enabled)
+        .label("Allow VR Specific Settings")
+        .on_toggle(|_| Message::SettingsToggleVrEnabled)
+        .size(14)
+        .text_size(13);
+
+    let mut col = column![heading, overlay_toggle, fov, vr_settings_toggle]
         .spacing(6)
-        .width(Length::Fill)
-        .into()
+        .width(Length::Fill);
+
+    if vr_enabled && has_vr {
+        let settings_col = build_column(config, input_devices, output_devices, true);
+        col = col.push(settings_col);
+    }
+
+    col.into()
 }

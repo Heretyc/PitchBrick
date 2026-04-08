@@ -29,6 +29,10 @@ It won't teach you how to change your voice. But once you're working on pitch, i
 - **Window position/size persistence**  remembers where you left it
 - **SteamVR overlay**  color indicator visible in VR headsets, with smooth color fading
 - **VR-specific settings**  separate frequency ranges, reminder settings, and audio devices for VR mode
+- **Push-to-Talk on Green**  holds your Discord PTT key only while you're in your target pitch range
+- **Vocal rest timer**  alerts when you exceed a configurable speaking threshold per hour
+- **Settings window**  visual configuration with draggable frequency range handles and VR FOV editor
+- **Start with Windows**  optional autostart via the system tray or settings
 
 ## Installation
 
@@ -133,6 +137,23 @@ output_device_name = ""
 # vr_width = 86.0     # Overlay width (pixel-like units)
 # vr_height = 86.0    # Overlay height (pixel-like units)
 ```
+
+### Push-to-Talk on Green
+
+PitchBrick can hold your Discord push-to-talk key **only while you're speaking in your target range**. Enable "Push-to-Talk on Green" from the tray menu and set the PTT key in Settings to match your Discord keybind.
+
+- **Green (in range):** PTT key is held — your voice transmits
+- **Red (out of range):** grace period until the reminder tone fires, then instant release
+- **Black (silence):** 100ms hold after silence, then release
+- **500ms minimum activation** prevents rapid key chatter
+
+This prevents voice transmission when you've drifted out of your trained range — no more embarrassing moments in voice chat. The PTT key can be set to keyboard keys (Tab, CapsLock, F1–F24), mouse buttons (Mouse4, Mouse5), or the backtick key (default).
+
+A first-time explanation dialog appears when you enable the feature. Configure the key in the Settings window under "PTT Key."
+
+### Vocal Rest Timer
+
+PitchBrick tracks how long you've been actively speaking and alerts you when you've exceeded a configurable threshold per hour. This helps protect your voice during long practice sessions. Set the threshold from the tray menu (5–50 minutes per hour, or OFF).
 
 ## How It Works
 

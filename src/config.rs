@@ -16,6 +16,10 @@ fn default_vocal_rest_minutes() -> u32 {
     30
 }
 
+fn default_ptt_key() -> String {
+    "`".to_string()
+}
+
 /// Maps mic sensitivity (1–100 slider) to a noise floor value.
 ///
 /// 1 → 0.20 (least sensitive, high noise floor)
@@ -142,7 +146,7 @@ impl Default for VrConfig {
             male_freq_high: 155.0,
             red_duration_seconds: 0.5,
             reminder_tone_freq: 165.0,
-            reminder_tone_volume: 0.5,
+            reminder_tone_volume: 0.75,
             vr_x: None,
             vr_y: None,
             vr_width: None,
@@ -274,6 +278,18 @@ pub struct Config {
     /// Valid values: 0, 5, 10, 15, 20, 30, 40, 50. Default: 30.
     #[serde(default = "default_vocal_rest_minutes")]
     pub vocal_rest_minutes: u32,
+    /// Whether Push-to-Talk on Green is enabled (holds a key while in target range).
+    #[serde(default)]
+    pub ptt_on_green: bool,
+    /// The key name used for Push-to-Talk (maps to a Windows virtual key code).
+    #[serde(default = "default_ptt_key")]
+    pub ptt_key: String,
+    /// Whether the user has acknowledged the first-time PTT explanation dialog.
+    #[serde(default)]
+    pub ptt_dialog_shown: bool,
+    /// Whether the user has acknowledged the first-time VR settings warning dialog.
+    #[serde(default)]
+    pub vr_dialog_shown: bool,
 }
 
 impl Default for Config {
@@ -286,7 +302,7 @@ impl Default for Config {
             male_freq_high: 155.0,
             red_duration_seconds: 0.5,
             reminder_tone_freq: 165.0,
-            reminder_tone_volume: 0.5,
+            reminder_tone_volume: 0.75,
             window_x: None,
             window_y: None,
             window_width: None,
@@ -302,6 +318,10 @@ impl Default for Config {
             start_menu_shortcut_declined: false,
             autostart: true,
             vocal_rest_minutes: 30,
+            ptt_on_green: false,
+            ptt_key: "`".to_string(),
+            ptt_dialog_shown: false,
+            vr_dialog_shown: false,
         }
     }
 }
@@ -577,6 +597,10 @@ mod tests {
         assert_eq!(config.male_freq_high, 155.0);
         assert_eq!(config.red_duration_seconds, 0.5);
         assert_eq!(config.reminder_tone_freq, 165.0);
+        assert_eq!(config.reminder_tone_volume, 0.75);
+        assert!(!config.ptt_on_green);
+        assert_eq!(config.ptt_key, "`");
+        assert!(!config.ptt_dialog_shown);
         assert!(!config.vr_specific_settings);
         assert!(config.vr.is_none());
         assert_eq!(config.vocal_rest_minutes, 30);

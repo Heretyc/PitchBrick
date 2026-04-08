@@ -1,6 +1,6 @@
 [package]
 name = "pitchbrick"
-version = "2.4.0"
+version = "2.5.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "Transgender vocal training pitch monitor"
@@ -42,7 +42,7 @@ semver = "1"
 rodio = { version = "0.19", default-features = false, features = ["wav"] }
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.58", features = ["Win32_UI_WindowsAndMessaging", "Win32_System_Registry", "Win32_UI_Shell", "Win32_System_Com", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp", "Win32_Foundation"] }
+windows = { version = "0.58", features = ["Win32_UI_WindowsAndMessaging", "Win32_System_Registry", "Win32_UI_Shell", "Win32_System_Com", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp", "Win32_Foundation", "Win32_UI_Input_KeyboardAndMouse"] }
 tray-icon = "0.21"
 
 [target.'cfg(windows)'.build-dependencies]

@@ -132,6 +132,21 @@ pub enum Message {
     /// 0 means OFF, otherwise minutes per hour.
     SetVocalRestMinutes(u32),
 
+    /// User toggled Push-to-Talk on Green from the tray menu.
+    TogglePttOnGreen,
+    /// User acknowledged the first-time PTT explanation dialog.
+    AcknowledgePttDialog,
+    /// The PTT explanation dialog window was opened.
+    PttDialogWindowOpened(window::Id),
+    /// User changed the PTT key in settings.
+    SettingsPttKeyChanged(String),
+    /// User toggled the SteamVR Overlay checkbox in settings.
+    SettingsToggleVrOverlay,
+    /// User acknowledged the first-time VR settings warning dialog.
+    AcknowledgeVrDialog,
+    /// The VR explanation dialog window was opened.
+    VrDialogWindowOpened(window::Id),
+
     /// Discards a task result with no side effect.
     Noop,
 }
@@ -225,6 +240,25 @@ pub struct PitchBrick {
     pub last_vocal_rest_tray_update: Instant,
     /// Whether the raw (pre-overage) display state was Green on the previous tick.
     pub was_raw_green: bool,
+    /// The most recent raw display state (before vocal rest override).
+    pub raw_display_state: DisplayState,
+    /// Whether the PTT key is currently being held down.
+    pub ptt_held: bool,
+    /// When the PTT key was first pressed (for 500ms minimum activation).
+    pub ptt_press_start: Option<Instant>,
+    /// When the PTT release timer started (100ms silence grace period).
+    pub ptt_release_timer: Option<Instant>,
+    /// Window ID of the PTT first-time explanation dialog.
+    pub ptt_dialog_window_id: Option<window::Id>,
+    /// Window ID of the VR first-time warning dialog.
+    pub vr_dialog_window_id: Option<window::Id>,
+    /// Monotonic counter incremented on every config/device change that
+    /// affects the settings view. Used as the `lazy` cache key so the
+    /// settings widget tree is only rebuilt when something actually changed,
+    /// not on every 16 ms tick.
+    pub settings_version: u64,
+    /// Timestamp of the last Tick message, used to detect slow frames.
+    pub last_tick: Instant,
 }
 
 impl PitchBrick {
@@ -353,6 +387,7 @@ impl PitchBrick {
             config.vr_specific_settings,
             config.vocal_rest_minutes,
             vocal_rest.accumulated_ms(now) / 1000,
+            config.ptt_on_green,
         );
 
         let update_check_rx = if should_check {
@@ -449,6 +484,14 @@ impl PitchBrick {
             rest_sound_stream,
             last_vocal_rest_tray_update: now,
             was_raw_green: false,
+            raw_display_state: DisplayState::Black,
+            ptt_held: false,
+            ptt_press_start: None,
+            ptt_release_timer: None,
+            ptt_dialog_window_id: None,
+            vr_dialog_window_id: None,
+            settings_version: 0,
+            last_tick: Instant::now(),
         };
 
         // Check Start Menu shortcut and open dialog if mismatched.
@@ -492,8 +535,74 @@ impl PitchBrick {
 
     /// Handles all application messages and returns side-effect tasks.
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        // Log all settings messages with precise timestamps for latency diagnosis.
+        match &message {
+            Message::SettingsToggleGender
+            | Message::SettingsCheckForUpdates
+            | Message::SettingsToggleAutostart => {
+                tracing::debug!("[settings] {:?} received t={:?}", message, Instant::now());
+            }
+            Message::SettingsFreqChanged { handle, value } => {
+                tracing::debug!("[settings] FreqChanged({:?}, {:.1}) t={:?}", handle, value, Instant::now());
+            }
+            Message::SettingsReminderFreqChanged(v) => {
+                tracing::debug!("[settings] ReminderFreq={:.1} t={:?}", v, Instant::now());
+            }
+            Message::SettingsRedDurationChanged(v) => {
+                tracing::debug!("[settings] RedDuration={:.1} t={:?}", v, Instant::now());
+            }
+            Message::SettingsReminderVolumeChanged(v) => {
+                tracing::debug!("[settings] ReminderVol={:.2} t={:?}", v, Instant::now());
+            }
+            Message::SettingsMicSensitivityChanged(v) => {
+                tracing::debug!("[settings] MicSens={:.0} t={:?}", v, Instant::now());
+            }
+            Message::SettingsSelectInputDevice(name) => {
+                tracing::debug!("[settings] InputDevice={} t={:?}", name, Instant::now());
+            }
+            Message::SettingsSelectOutputDevice(name) => {
+                tracing::debug!("[settings] OutputDevice={} t={:?}", name, Instant::now());
+            }
+            Message::SettingsPttKeyChanged(key) => {
+                tracing::debug!("[settings] PttKey={} t={:?}", key, Instant::now());
+            }
+            Message::SettingsVrFreqChanged { handle, value } => {
+                tracing::debug!("[settings] VrFreqChanged({:?}, {:.1}) t={:?}", handle, value, Instant::now());
+            }
+            Message::SettingsVrFovDragged { x, y } => {
+                tracing::debug!("[settings] VrFovDragged({}, {}) t={:?}", x, y, Instant::now());
+            }
+            Message::SettingsVrReminderFreqChanged(v) => {
+                tracing::debug!("[settings] VrReminderFreq={:.1} t={:?}", v, Instant::now());
+            }
+            Message::SettingsVrRedDurationChanged(v) => {
+                tracing::debug!("[settings] VrRedDuration={:.1} t={:?}", v, Instant::now());
+            }
+            Message::SettingsVrReminderVolumeChanged(v) => {
+                tracing::debug!("[settings] VrReminderVol={:.2} t={:?}", v, Instant::now());
+            }
+            Message::SettingsVrMicSensitivityChanged(v) => {
+                tracing::debug!("[settings] VrMicSens={:.0} t={:?}", v, Instant::now());
+            }
+            Message::SettingsVrToggleGender
+            | Message::SettingsToggleVrEnabled
+            | Message::SettingsToggleVrOverlay => {
+                tracing::debug!("[settings] {:?} received t={:?}", message, Instant::now());
+            }
+            Message::DragWindow(_) => {
+                tracing::debug!("[settings] DragWindow received t={:?}", Instant::now());
+            }
+            _ => {}
+        }
         match message {
             Message::Tick(now) => {
+                // --- Slow frame detection ---
+                let frame_dt = now.duration_since(self.last_tick);
+                if frame_dt > Duration::from_millis(32) {
+                    tracing::debug!("[perf] slow frame: {:.1}ms t={:?}", frame_dt.as_secs_f64() * 1000.0, now);
+                }
+                self.last_tick = now;
+
                 // --- Tray menu event polling ---
                 if let Ok(event) = tray::menu_event_receiver().try_recv() {
                     return self.update(Message::TrayMenuEvent(event.id));
@@ -502,7 +611,9 @@ impl PitchBrick {
                 // --- Audio analysis (results produced by background worker thread) ---
                 if let Some(last) = self.analysis_worker.latest_result() {
                     self.detected_freq = last;
-                    tracing::debug!("result: {:?}", last);
+                    if last.is_some() {
+                        tracing::debug!("result: {:?}", last);
+                    }
 
                     // Classify raw display state (before vocal rest override).
                     let raw_state = match last {
@@ -531,6 +642,7 @@ impl PitchBrick {
                         }
                         None => DisplayState::Black,
                     };
+                    self.raw_display_state = raw_state;
 
                     // --- Vocal rest: track green enter/exit ---
                     let is_raw_green = raw_state == DisplayState::Green;
@@ -549,7 +661,12 @@ impl PitchBrick {
 
                     // Play rest sound on overage entry and every 60s while in green.
                     if just_entered_overage {
-                        tracing::info!("Vocal rest: entered overage mode");
+                        tracing::info!(
+                            "Vocal rest: entered overage (accumulated={}ms, threshold={} min, stream={})",
+                            self.vocal_rest.accumulated_ms(now),
+                            self.config.vocal_rest_minutes,
+                            self.rest_sound_stream.is_some()
+                        );
                     }
                     if self.vocal_rest.in_overage
                         && is_raw_green
@@ -557,9 +674,19 @@ impl PitchBrick {
                     {
                         if let Some((_, ref handle)) = self.rest_sound_stream {
                             let cursor = std::io::Cursor::new(crate::vocal_rest::REST_WAV);
-                            if let Err(e) = handle.play_once(cursor) {
-                                tracing::error!("Failed to play rest sound: {}", e);
+                            match handle.play_once(cursor) {
+                                Ok(_sink) => {
+                                    tracing::info!(
+                                        "Vocal rest: playing rest sound ({} bytes WAV)",
+                                        crate::vocal_rest::REST_WAV.len()
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::error!("Vocal rest: failed to play rest sound: {}", e);
+                                }
                             }
+                        } else {
+                            tracing::warn!("Vocal rest: no output stream available for rest sound");
                         }
                     }
 
@@ -644,6 +771,97 @@ impl PitchBrick {
                                 }
                             }
                         }
+                    }
+                }
+
+                // --- Push-to-Talk on Green ---
+                {
+                    let ptt_enabled =
+                        self.config.ptt_on_green && self.config.ptt_dialog_shown;
+
+                    if ptt_enabled {
+                        // Alert condition: Red for >= red_duration (tone fires or tooltip shown).
+                        let alert_condition_met = self.display_state == DisplayState::Red
+                            && self.red_since.is_some_and(|rs| {
+                                now.duration_since(rs).as_secs_f32()
+                                    >= self.config.effective_red_duration()
+                            });
+
+                        // Determine if PTT should be active based on raw pitch state.
+                        // Green = hold, Red = grace period (hold until alert), Black = silence.
+                        let want_active = match self.raw_display_state {
+                            DisplayState::Green => true,
+                            DisplayState::Red
+                                if self.ptt_held && !alert_condition_met =>
+                            {
+                                true
+                            }
+                            _ => false,
+                        };
+
+                        if alert_condition_met && self.ptt_held {
+                            // Alert fired → instant release, overrides minimum activation.
+                            if let Some(vk) =
+                                crate::ptt::key_name_to_vk(&self.config.ptt_key)
+                            {
+                                crate::ptt::release_key(vk);
+                                tracing::debug!("PTT: released (alert condition met)");
+                            }
+                            self.ptt_held = false;
+                            self.ptt_press_start = None;
+                            self.ptt_release_timer = None;
+                        } else if want_active {
+                            if !self.ptt_held {
+                                if let Some(vk) =
+                                    crate::ptt::key_name_to_vk(&self.config.ptt_key)
+                                {
+                                    crate::ptt::press_key(vk);
+                                    tracing::debug!("PTT: pressed");
+                                }
+                                self.ptt_held = true;
+                                self.ptt_press_start = Some(now);
+                            }
+                            self.ptt_release_timer = None;
+                        } else if self.ptt_held {
+                            // Want to release: apply 100ms silence grace + 500ms minimum.
+                            if self.ptt_release_timer.is_none() {
+                                self.ptt_release_timer = Some(now);
+                            }
+                            let silence_grace_met = self.ptt_release_timer.is_some_and(
+                                |t| {
+                                    now.duration_since(t)
+                                        >= Duration::from_millis(100)
+                                },
+                            );
+                            let min_activation_met =
+                                self.ptt_press_start.is_none_or(|t| {
+                                    now.duration_since(t)
+                                        >= Duration::from_millis(500)
+                                });
+
+                            if silence_grace_met && min_activation_met {
+                                if let Some(vk) =
+                                    crate::ptt::key_name_to_vk(&self.config.ptt_key)
+                                {
+                                    crate::ptt::release_key(vk);
+                                    tracing::debug!("PTT: released (silence grace expired)");
+                                }
+                                self.ptt_held = false;
+                                self.ptt_press_start = None;
+                                self.ptt_release_timer = None;
+                            }
+                        }
+                    } else if self.ptt_held {
+                        // PTT was disabled while held → release immediately.
+                        if let Some(vk) =
+                            crate::ptt::key_name_to_vk(&self.config.ptt_key)
+                        {
+                            crate::ptt::release_key(vk);
+                            tracing::debug!("PTT: released (feature disabled)");
+                        }
+                        self.ptt_held = false;
+                        self.ptt_press_start = None;
+                        self.ptt_release_timer = None;
                     }
                 }
 
@@ -856,7 +1074,7 @@ impl PitchBrick {
                     return window::gain_focus(id);
                 }
                 let (win_id, open_task) = window::open(window::Settings {
-                    size: Size::new(800.0, 500.0),
+                    size: Size::new(800.0, 600.0),
                     position: window::Position::Centered,
                     resizable: false,
                     decorations: true,
@@ -953,6 +1171,9 @@ impl PitchBrick {
                 } else if menu_id == ids.vr_specific_settings_toggle {
                     drop(ids);
                     return self.update(Message::ToggleVrSpecificSettings);
+                } else if menu_id == ids.ptt_on_green_toggle {
+                    drop(ids);
+                    return self.update(Message::TogglePttOnGreen);
                 } else if menu_id == ids.patreon {
                     drop(ids);
                     return self.update(Message::OpenPatreon);
@@ -1037,6 +1258,18 @@ impl PitchBrick {
                 );
                 self.handle_vr_mode_transition();
                 self.send_tray_rebuild();
+
+                if self.config.vr_specific_settings && !self.config.vr_dialog_shown {
+                    let (_win_id, open_task) = window::open(window::Settings {
+                        size: Size::new(440.0, 300.0),
+                        resizable: false,
+                        decorations: true,
+                        exit_on_close_request: false,
+                        ..Default::default()
+                    });
+                    return open_task.map(Message::VrDialogWindowOpened);
+                }
+
                 Task::none()
             }
             Message::ToggleAutostart => {
@@ -1061,7 +1294,105 @@ impl PitchBrick {
                 self.send_tray_rebuild();
                 Task::none()
             }
+            Message::TogglePttOnGreen => {
+                self.config.ptt_on_green = !self.config.ptt_on_green;
+
+                if self.config.ptt_on_green && !self.config.ptt_dialog_shown {
+                    // First time: open explanation dialog, PTT gated until acknowledged.
+                    let (win_id, open_task) = window::open(window::Settings {
+                        size: Size::new(440.0, 300.0),
+                        resizable: false,
+                        decorations: true,
+                        exit_on_close_request: false,
+                        ..Default::default()
+                    });
+                    self.ptt_dialog_window_id = Some(win_id);
+                    self.config.save(&Config::path());
+                    self.config_last_modified = std::fs::metadata(Config::path())
+                        .ok()
+                        .and_then(|m| m.modified().ok());
+                    tracing::info!("PTT on Green toggled on (dialog pending)");
+                    self.send_tray_rebuild();
+                    return open_task.map(Message::PttDialogWindowOpened);
+                }
+
+                // Turning off: release key if held.
+                if !self.config.ptt_on_green && self.ptt_held {
+                    if let Some(vk) = crate::ptt::key_name_to_vk(&self.config.ptt_key) {
+                        crate::ptt::release_key(vk);
+                    }
+                    self.ptt_held = false;
+                    self.ptt_press_start = None;
+                    self.ptt_release_timer = None;
+                }
+
+                self.config.save(&Config::path());
+                self.config_last_modified = std::fs::metadata(Config::path())
+                    .ok()
+                    .and_then(|m| m.modified().ok());
+                tracing::info!("PTT on Green toggled to {}", self.config.ptt_on_green);
+                self.send_tray_rebuild();
+                Task::none()
+            }
+            Message::AcknowledgePttDialog => {
+                self.config.ptt_dialog_shown = true;
+                self.config.save(&Config::path());
+                self.config_last_modified = std::fs::metadata(Config::path())
+                    .ok()
+                    .and_then(|m| m.modified().ok());
+                tracing::info!("PTT dialog acknowledged, PTT now active");
+                if let Some(id) = self.ptt_dialog_window_id.take() {
+                    window::close(id)
+                } else {
+                    Task::none()
+                }
+            }
+            Message::PttDialogWindowOpened(id) => {
+                self.ptt_dialog_window_id = Some(id);
+                window::gain_focus(id)
+            }
+            Message::AcknowledgeVrDialog => {
+                self.config.vr_dialog_shown = true;
+                self.config.save(&Config::path());
+                self.config_last_modified = std::fs::metadata(Config::path())
+                    .ok()
+                    .and_then(|m| m.modified().ok());
+                tracing::info!("VR dialog acknowledged");
+                if let Some(id) = self.vr_dialog_window_id.take() {
+                    window::close(id)
+                } else {
+                    Task::none()
+                }
+            }
+            Message::VrDialogWindowOpened(id) => {
+                self.vr_dialog_window_id = Some(id);
+                window::gain_focus(id)
+            }
+            Message::SettingsPttKeyChanged(key) => {
+                // If PTT is currently held, release old key and press new one.
+                if self.ptt_held {
+                    if let Some(old_vk) = crate::ptt::key_name_to_vk(&self.config.ptt_key) {
+                        crate::ptt::release_key(old_vk);
+                    }
+                    self.config.ptt_key = key;
+                    if let Some(new_vk) = crate::ptt::key_name_to_vk(&self.config.ptt_key) {
+                        crate::ptt::press_key(new_vk);
+                    }
+                } else {
+                    self.config.ptt_key = key;
+                }
+                tracing::info!("PTT key changed to '{}'", self.config.ptt_key);
+                self.mark_settings_dirty();
+                Task::none()
+            }
             Message::QuitRequested => {
+                // Release PTT key before quitting.
+                if self.ptt_held {
+                    if let Some(vk) = crate::ptt::key_name_to_vk(&self.config.ptt_key) {
+                        crate::ptt::release_key(vk);
+                    }
+                    self.ptt_held = false;
+                }
                 // Save any pending settings changes before quitting.
                 if let Some(ref state) = self.settings_state {
                     if state.dirty {
@@ -1195,7 +1526,7 @@ impl PitchBrick {
             }
             Message::SettingsWindowOpened(id) => {
                 self.settings_window_id = Some(id);
-                Task::none()
+                window::gain_focus(id)
             }
             Message::WindowCloseRequested(id) => {
                 // Settings window close
@@ -1215,6 +1546,33 @@ impl PitchBrick {
                 // Log window close
                 if Some(id) == self.log_window_id {
                     self.log_window_id = None;
+                    return window::close(id);
+                }
+                // VR dialog close without acknowledgment: revert toggle
+                if Some(id) == self.vr_dialog_window_id {
+                    if !self.config.vr_dialog_shown {
+                        self.config.vr_specific_settings = false;
+                        self.config.save(&Config::path());
+                        self.config_last_modified = std::fs::metadata(Config::path())
+                            .ok()
+                            .and_then(|m| m.modified().ok());
+                        self.handle_vr_mode_transition();
+                        self.send_tray_rebuild();
+                    }
+                    self.vr_dialog_window_id = None;
+                    return window::close(id);
+                }
+                // PTT dialog close without acknowledgment: revert toggle
+                if Some(id) == self.ptt_dialog_window_id {
+                    if !self.config.ptt_dialog_shown {
+                        self.config.ptt_on_green = false;
+                        self.config.save(&Config::path());
+                        self.config_last_modified = std::fs::metadata(Config::path())
+                            .ok()
+                            .and_then(|m| m.modified().ok());
+                        self.send_tray_rebuild();
+                    }
+                    self.ptt_dialog_window_id = None;
                     return window::close(id);
                 }
                 Task::none()
@@ -1311,6 +1669,7 @@ impl PitchBrick {
                 self.update(Message::SelectOutputDevice(name))
             }
             Message::SettingsToggleVrEnabled => self.update(Message::ToggleVrSpecificSettings),
+            Message::SettingsToggleVrOverlay => self.update(Message::ToggleVrOverlay),
             Message::SettingsVrToggleGender => {
                 if let Some(ref mut vr) = self.config.vr {
                     vr.target_gender = vr.target_gender.toggle();
@@ -1454,6 +1813,7 @@ impl PitchBrick {
             s.dirty = true;
             s.last_change = Some(Instant::now());
         }
+        self.settings_version = self.settings_version.wrapping_add(1);
     }
 
     /// Detects VR mode transitions and sends appropriate tray commands.
@@ -1572,7 +1932,8 @@ impl PitchBrick {
     }
 
     /// Sends a rebuild command to the tray thread with the current state.
-    fn send_tray_rebuild(&self) {
+    fn send_tray_rebuild(&mut self) {
+        self.settings_version = self.settings_version.wrapping_add(1);
         let effective_input = self.config.effective_input_device();
         let selected_input = if effective_input.is_empty() {
             audio::devices::default_input_display_name().unwrap_or_default()
@@ -1597,6 +1958,7 @@ impl PitchBrick {
             vr_mode_active: self.vr_mode_active,
             vocal_rest_minutes: self.config.vocal_rest_minutes,
             vocal_rest_trained_secs: self.vocal_rest.accumulated_ms(Instant::now()) / 1000,
+            ptt_on_green: self.config.ptt_on_green,
         });
     }
 
@@ -1608,6 +1970,10 @@ impl PitchBrick {
             "PitchBrick - Update".to_string()
         } else if Some(id) == self.shortcut_window_id {
             "PitchBrick - Shortcut".to_string()
+        } else if Some(id) == self.ptt_dialog_window_id {
+            "PitchBrick - Push-to-Talk".to_string()
+        } else if Some(id) == self.vr_dialog_window_id {
+            "PitchBrick - VR Settings".to_string()
         } else if Some(id) == self.log_window_id {
             "PitchBrick - Log".to_string()
         } else {
@@ -1642,6 +2008,12 @@ impl PitchBrick {
                 .unwrap_or_else(|_| "?".into());
             return crate::ui::shortcut_window::view(old, &current);
         }
+        if Some(id) == self.ptt_dialog_window_id {
+            return crate::ui::ptt_dialog::view();
+        }
+        if Some(id) == self.vr_dialog_window_id {
+            return crate::ui::vr_dialog::view();
+        }
         if Some(id) == self.log_window_id {
             crate::ui::log_window::view(&self.log_lines)
         } else {
@@ -1661,7 +2033,7 @@ impl PitchBrick {
         let tick =
             iced::time::every(Duration::from_millis(16)).map(|_| Message::Tick(Instant::now()));
 
-        let window_events = iced::event::listen_with(|event, _status, id| match event {
+        let window_events = iced::event::listen_with(|event, status, id| match event {
             iced::Event::Window(window_event) => match window_event {
                 iced::window::Event::Moved(point) => Some(Message::WindowMoved(id, point)),
                 iced::window::Event::Resized(size) => Some(Message::WindowResized(id, size)),
@@ -1670,10 +2042,27 @@ impl PitchBrick {
                 }
                 _ => None,
             },
-            // Left-click on any window → DragWindow (handler checks it's the main window).
+            // Left-click → DragWindow only when no widget captured the event.
+            // This prevents spurious update+view cycles when clicking buttons,
+            // sliders, or pick-lists in the settings window.
             iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
                 iced::mouse::Button::Left,
-            )) => Some(Message::DragWindow(id)),
+            )) if status == iced::event::Status::Ignored => {
+                tracing::debug!("[input] mouse left pressed (ignored by widgets) t={:?}", Instant::now());
+                Some(Message::DragWindow(id))
+            }
+            iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
+                iced::mouse::Button::Left,
+            )) => {
+                tracing::debug!("[input] mouse left pressed (captured by widget) t={:?}", Instant::now());
+                None
+            }
+            iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                iced::mouse::Button::Left,
+            )) => {
+                tracing::debug!("[input] mouse left released t={:?}", Instant::now());
+                None
+            }
             _ => None,
         });
 
