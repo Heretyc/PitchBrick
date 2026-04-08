@@ -468,8 +468,11 @@ pub fn view<'a>(
 
     let pishock_btn = button(text("PiShock Settings").size(13)).style(button::secondary);
     let osc_btn = button(text("OSC Settings").size(13)).style(button::secondary);
+    let wipe_btn = button(text("Wipe all settings").size(13))
+        .on_press(Message::OpenWipeDialog)
+        .style(button::danger);
 
-    let top_row = row![check_updates_btn, autostart_cb, pishock_btn, osc_btn]
+    let top_row = row![check_updates_btn, autostart_cb, pishock_btn, osc_btn, wipe_btn]
         .spacing(12)
         .align_y(Alignment::Center)
         .padding(Padding::from(4));

@@ -95,7 +95,87 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LogCaptureLayer {
     }
 }
 
+#[cfg(windows)]
+mod single_instance {
+    use std::sync::atomic::{AtomicIsize, Ordering};
+
+    /// Raw handle value stored as isize (HANDLE is a pointer wrapper).
+    static MUTEX_HANDLE: AtomicIsize = AtomicIsize::new(0);
+
+    /// Acquires the global named mutex. Returns `false` if another instance
+    /// already holds it (caller should exit).
+    pub fn acquire() -> bool {
+        use windows::Win32::Foundation::{CloseHandle, GetLastError};
+        use windows::Win32::System::Threading::CreateMutexW;
+        use windows::core::w;
+
+        unsafe {
+            match CreateMutexW(None, false, w!("Global\\PitchBrick_SingleInstance")) {
+                Ok(handle) => {
+                    if GetLastError().is_err() {
+                        let _ = CloseHandle(handle);
+                        return false;
+                    }
+                    MUTEX_HANDLE.store(handle.0 as isize, Ordering::SeqCst);
+                    true
+                }
+                Err(_) => {
+                    eprintln!("Warning: could not create single-instance mutex");
+                    true // proceed anyway
+                }
+            }
+        }
+    }
+
+    /// Releases the mutex so a restarted process can acquire it.
+    pub fn release() {
+        use windows::Win32::Foundation::{CloseHandle, HANDLE};
+
+        let raw = MUTEX_HANDLE.swap(0, std::sync::atomic::Ordering::SeqCst);
+        if raw != 0 {
+            unsafe {
+                let _ = CloseHandle(HANDLE(raw as *mut core::ffi::c_void));
+            }
+        }
+    }
+}
+
+/// Wipes all user settings files, releases the single-instance mutex,
+/// spawns a fresh PitchBrick process, and exits.
+pub fn wipe_and_restart() {
+    let files = [
+        config::Config::path(),
+        vocal_rest::VocalRestTracker::path(),
+    ];
+    for path in &files {
+        if path.exists() {
+            match std::fs::remove_file(path) {
+                Ok(()) => tracing::info!("Deleted {}", path.display()),
+                Err(e) => tracing::error!("Failed to delete {}: {}", path.display(), e),
+            }
+        }
+    }
+
+    // Release the single-instance mutex so the new process can acquire it.
+    #[cfg(windows)]
+    single_instance::release();
+
+    // Spawn a new PitchBrick process.
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = std::process::Command::new(exe).spawn();
+    }
+
+    std::process::exit(0);
+}
+
 fn main() -> iced::Result {
+    // ── Single-instance guard ──
+    #[cfg(windows)]
+    if !single_instance::acquire() {
+        eprintln!("PitchBrick is already running.");
+        std::process::exit(0);
+    }
+
     let cli = Cli::parse();
 
     let log_rx = if cli.verbose {

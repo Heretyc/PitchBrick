@@ -147,6 +147,13 @@ pub enum Message {
     /// The VR explanation dialog window was opened.
     VrDialogWindowOpened(window::Id),
 
+    /// User clicked "Wipe all settings" in the settings window.
+    OpenWipeDialog,
+    /// The wipe confirmation dialog window was opened.
+    WipeDialogWindowOpened(window::Id),
+    /// User confirmed the wipe by clicking "DELETE EVERYTHING".
+    ConfirmWipeSettings,
+
     /// Discards a task result with no side effect.
     Noop,
 }
@@ -252,6 +259,8 @@ pub struct PitchBrick {
     pub ptt_dialog_window_id: Option<window::Id>,
     /// Window ID of the VR first-time warning dialog.
     pub vr_dialog_window_id: Option<window::Id>,
+    /// Window ID of the wipe-settings confirmation dialog.
+    pub wipe_dialog_window_id: Option<window::Id>,
     /// Monotonic counter incremented on every config/device change that
     /// affects the settings view. Used as the `lazy` cache key so the
     /// settings widget tree is only rebuilt when something actually changed,
@@ -490,6 +499,7 @@ impl PitchBrick {
             ptt_release_timer: None,
             ptt_dialog_window_id: None,
             vr_dialog_window_id: None,
+            wipe_dialog_window_id: None,
             settings_version: 0,
             last_tick: Instant::now(),
         };
@@ -1368,6 +1378,28 @@ impl PitchBrick {
                 self.vr_dialog_window_id = Some(id);
                 window::gain_focus(id)
             }
+            Message::OpenWipeDialog => {
+                if self.wipe_dialog_window_id.is_some() {
+                    return Task::none();
+                }
+                let (_win_id, open_task) = window::open(window::Settings {
+                    size: Size::new(440.0, 360.0),
+                    resizable: false,
+                    decorations: true,
+                    exit_on_close_request: false,
+                    ..Default::default()
+                });
+                open_task.map(Message::WipeDialogWindowOpened)
+            }
+            Message::WipeDialogWindowOpened(id) => {
+                self.wipe_dialog_window_id = Some(id);
+                window::gain_focus(id)
+            }
+            Message::ConfirmWipeSettings => {
+                tracing::info!("User confirmed wipe — deleting all settings and restarting");
+                crate::wipe_and_restart();
+                Task::none() // unreachable — process exits in wipe_and_restart
+            }
             Message::SettingsPttKeyChanged(key) => {
                 // If PTT is currently held, release old key and press new one.
                 if self.ptt_held {
@@ -1573,6 +1605,11 @@ impl PitchBrick {
                         self.send_tray_rebuild();
                     }
                     self.ptt_dialog_window_id = None;
+                    return window::close(id);
+                }
+                // Wipe dialog close — just dismiss, no side effects
+                if Some(id) == self.wipe_dialog_window_id {
+                    self.wipe_dialog_window_id = None;
                     return window::close(id);
                 }
                 Task::none()
@@ -1974,6 +2011,8 @@ impl PitchBrick {
             "PitchBrick - Push-to-Talk".to_string()
         } else if Some(id) == self.vr_dialog_window_id {
             "PitchBrick - VR Settings".to_string()
+        } else if Some(id) == self.wipe_dialog_window_id {
+            "PitchBrick - Wipe Settings".to_string()
         } else if Some(id) == self.log_window_id {
             "PitchBrick - Log".to_string()
         } else {
@@ -2013,6 +2052,9 @@ impl PitchBrick {
         }
         if Some(id) == self.vr_dialog_window_id {
             return crate::ui::vr_dialog::view();
+        }
+        if Some(id) == self.wipe_dialog_window_id {
+            return crate::ui::wipe_dialog::view();
         }
         if Some(id) == self.log_window_id {
             crate::ui::log_window::view(&self.log_lines)
