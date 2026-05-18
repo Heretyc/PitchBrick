@@ -3719,7 +3719,7 @@ dependencies = [
 
 [[package]]
 name = "pitchbrick"
-version = "2.5.0"
+version = "2.5.5"
 dependencies = [
  "clap",
  "cpal 0.17.1",
